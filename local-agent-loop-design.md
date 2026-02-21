@@ -1,10 +1,130 @@
 # Local First Agent System Design for Desktop
 
+## Introduction
+
+This design describes a desktop-first agent system for Windows and macOS that combines a **local agent runtime** with **centralized governance services**.
+
+The core idea is simple:
+
+- run the **Agent Loop locally** for fast file and tool interactions
+- route all **LLM calls through a backend LLM Gateway** for consistent guardrails and policy enforcement
+- keep **policy, approvals, workspace artifacts, audit, and telemetry** as centralized services
+
+This gives the user a responsive local experience while preserving enterprise-grade control and observability.
+
+### High level summary
+
+The system is split into two major parts:
+
+1. **Desktop runtime on the client machine**
+
+   - **Desktop App** provides the user interface
+   - **Local Agent Host** runs the agent loop and orchestrates steps
+   - **Local Tool Runtime** executes tools such as file edits, shell commands, and git operations
+   - **Local Policy Enforcer** applies local capability and path restrictions
+   - **Local Approval UI** handles user confirmation for risky actions
+   - **Local State Store** supports checkpointing and session resume
+
+2. **Remote governance and platform services**
+
+   - **Session Service** creates and resumes sessions and performs compatibility checks
+   - **Policy Service** generates signed policy bundles and approval rules
+   - **LLM Gateway** enforces LLM guardrails and routes model requests
+   - **Approval Service** persists approval decisions
+   - **Workspace Service** stores artifacts and checkpoints using **Artifact Store** and **Metadata Store**
+   - **Audit Service** and **Telemetry Service** provide centralized traceability and operations visibility
+
+### Why this design exists
+
+This design intentionally balances two competing needs:
+
+- **Local-first productivity**
+
+  - direct file access
+  - local tool execution
+  - low latency interactions
+
+- **Centralized enterprise controls**
+
+  - guardrails on all LLM traffic
+  - consistent policy and capability enforcement
+  - auditability and telemetry
+  - approval persistence and governance
+
+Instead of forcing the full agent runtime into the backend, the design keeps the agent loop local for desktop UX and uses backend services where central consistency matters most.
+
+### Key design elements to understand first
+
+Before reading the detailed sections, these are the most important building blocks:
+
+#### 1) Agent Loop location
+
+The **Agent Loop** runs in **Local Agent Host** on the desktop machine. This is the main orchestration engine for planning, step execution, tool routing, and retries.
+
+#### 2) LLM governance path
+
+All LLM requests and responses go through **LLM Gateway**. This is the central enforcement point for:
+
+- request guardrails
+- response guardrails
+- token budgets
+- model routing
+- LLM audit metadata
+
+#### 3) Capability based security
+
+The system uses a **signed policy bundle** issued by **Policy Service** at session start. Capabilities define what the local agent is allowed to do, such as:
+
+- file read and write
+- shell execution
+- network access
+- git actions
+- remote tool invocation
+
+The policy is enforced locally by **Local Policy Enforcer** and centrally by relevant backend services.
+
+#### 4) Transport model
+
+For the desktop-first version, the design avoids unnecessary real-time complexity:
+
+- **Desktop App to Local Agent Host** uses local JSON-RPC over stdio or local socket
+- **Local Agent Host to backend services** uses HTTPS REST
+- **Local Agent Host to LLM Gateway** uses HTTP streaming
+
+WebSocket is optional and only needed later for server-initiated push scenarios.
+
+#### 5) Shared runtime contract for future web support
+
+Even though this document is desktop-first, the protocol and state model are designed so the same logical agent runtime can later run in a backend sandbox for web.
+
+That is why the design standardizes:
+
+- event names
+- tool schemas
+- capability names
+- error model
+- checkpoint and artifact patterns
+
+### How to read this document
+
+A good reading order is:
+
+1. **Deployment model and component names**
+2. **Bounded contexts**
+3. **Architecture and sequence diagrams**
+4. **Capability model and policy bundle**
+5. **Protocol contracts and schemas**
+6. **Repo mapping for implementation planning**
+7. **Web extension section**
+
+This order helps you understand the intent and boundaries first, then the protocols and implementation details.
+
 ## Scope
 
 This document defines a desktop-first system design for a Windows and macOS app similar to Claude Code.
 
 Core goals:
+
 - Agent loop runs on the client
 - Tool execution runs on the client
 - LLM calls route through a backend LLM Gateway for centralized guardrails
@@ -42,6 +162,7 @@ WebSocket is optional later for server-initiated push use cases only.
 ## 2) Consistent Component Names
 
 ### Desktop Components
+
 - **Desktop App**
 - **Local Agent Host**
 - **Local Tool Runtime**
@@ -50,6 +171,7 @@ WebSocket is optional later for server-initiated push use cases only.
 - **Local State Store**
 
 ### Remote Services
+
 - **Session Service**
 - **LLM Gateway**
 - **Policy Service**
@@ -62,6 +184,7 @@ WebSocket is optional later for server-initiated push use cases only.
 - **Backend Tool Service** (optional for remote-only tools)
 
 ### Web Adaptation Components
+
 - **Sandbox Agent Host**
 - **Sandbox Tool Runtime**
 - **Sandbox State Store**
@@ -71,13 +194,16 @@ WebSocket is optional later for server-initiated push use cases only.
 ## 3) Bounded Contexts
 
 ### 3.1 Agent Execution Context
+
 **Purpose:** Run the agent loop for the session.
 
 **Owned Components**
+
 - Local Agent Host
 - Local State Store
 
 **Responsibilities**
+
 - Session state machine
 - Planning and step execution
 - LLM request construction
@@ -87,19 +213,23 @@ WebSocket is optional later for server-initiated push use cases only.
 - Event generation
 
 **Does Not Own**
+
 - Central policy definitions
 - Long-term artifact storage
 - Audit persistence
 - User identity management
 
 ### 3.2 Tool Execution Context
+
 **Purpose:** Execute tools safely and consistently.
 
 **Owned Components**
+
 - Local Tool Runtime
 - Backend Tool Service (optional)
 
 **Responsibilities**
+
 - Local filesystem actions
 - Local process execution
 - Tool output capture
@@ -107,20 +237,24 @@ WebSocket is optional later for server-initiated push use cases only.
 - Capability checks integration
 
 **Does Not Own**
+
 - Agent planning
 - LLM invocation
 - Approval decisions
 - Policy authoring
 
 ### 3.3 Policy and Guardrails Context
+
 **Purpose:** Enforce governance for tool actions and LLM traffic.
 
 **Owned Components**
+
 - Policy Service
 - Local Policy Enforcer
 - LLM Gateway (for LLM request and response guardrails)
 
 **Responsibilities**
+
 - Policy bundle generation
 - Signed policy bundles
 - Capability restrictions
@@ -131,17 +265,21 @@ WebSocket is optional later for server-initiated push use cases only.
 - Budget and quota rules
 
 **Does Not Own**
+
 - UI rendering
 - Agent planning
 - Artifact storage
 
 ### 3.4 Session Coordination Context
+
 **Purpose:** Establish sessions and maintain lifecycle metadata.
 
 **Owned Components**
+
 - Session Service
 
 **Responsibilities**
+
 - Create and resume sessions
 - Version compatibility checks
 - Capability handshake
@@ -150,19 +288,23 @@ WebSocket is optional later for server-initiated push use cases only.
 - Event replay cursors (optional)
 
 **Does Not Own**
+
 - Agent execution
 - Tool execution
 - LLM provider communication
 
 ### 3.5 Workspace and Artifacts Context
+
 **Purpose:** Persist and serve artifacts and checkpoints.
 
 **Owned Components**
+
 - Workspace Service
 - Artifact Store
 - Metadata Store
 
 **Responsibilities**
+
 - Workspace manifests
 - Artifact upload and retrieval
 - Checkpoint references
@@ -170,41 +312,50 @@ WebSocket is optional later for server-initiated push use cases only.
 - Step output references
 
 **Does Not Own**
+
 - Policy decisions
 - LLM calls
 - Agent logic
 
 ### 3.6 Approval Context
+
 **Purpose:** Capture and persist human approvals for risky actions.
 
 **Owned Components**
+
 - Approval Service
 - Local Approval UI
 
 **Responsibilities**
+
 - Approval request lifecycle
 - User decision capture
 - Approval decision persistence
 - Approval audit trail
 
 **Does Not Own**
+
 - Tool execution engine
 - Agent planning logic
 
 ### 3.7 Observability and Audit Context
+
 **Purpose:** Central telemetry and audit.
 
 **Owned Components**
+
 - Telemetry Service
 - Audit Service
 
 **Responsibilities**
+
 - Structured event ingest
 - Traces and metrics
 - Security audit records
 - Session event history (if retained)
 
 **Does Not Own**
+
 - Agent execution
 - Tool execution
 - Policy decisions
@@ -214,28 +365,36 @@ WebSocket is optional later for server-initiated push use cases only.
 ## 4) Core Design Principles
 
 ### 4.1 Local First Execution
+
 The desktop experience should remain local-first for:
+
 - file operations
 - tool execution
 - step control
 - approval presentation
 
 ### 4.2 Centralized LLM Governance
+
 All model traffic flows through **LLM Gateway** for:
+
 - guardrails
 - audit
 - token accounting
 - model routing
 
 ### 4.3 Shared Runtime Contract
+
 Define one runtime contract reusable later for web:
+
 - same event names
 - same tool schemas
 - same checkpoint format
 - same state machine
 
 ### 4.4 Capability Based Security
+
 Capabilities include examples such as:
+
 - `File.Read`
 - `File.Write`
 - `File.Delete`
@@ -305,6 +464,7 @@ flowchart LR
 At session start, **Local Agent Host** performs a handshake with **Session Service**.
 
 ### Handshake request
+
 - OS type and version
 - Desktop App version
 - Local Agent Host version
@@ -313,6 +473,7 @@ At session start, **Local Agent Host** performs a handshake with **Session Servi
 - cached policy bundle version (optional)
 
 ### Handshake response
+
 - session id
 - compatibility status
 - signed policy bundle
@@ -330,6 +491,7 @@ This ensures the local loop receives centrally governed policy before work start
 Owned by **Local Agent Host**.
 
 States:
+
 - `SESSION_CREATED`
 - `SESSION_RUNNING`
 - `WAITING_FOR_LLM`
@@ -455,23 +617,25 @@ Capabilities are issued by **Policy Service** in a signed policy bundle and enfo
 
 ### Capability Table
 
-| Capability | Description | Typical Scope | Approval Required | Enforced By |
-|---|---|---|---|---|
-| `File.Read` | Read file contents | Allowed path prefixes | Usually no | Local Policy Enforcer, Local Tool Runtime |
-| `File.Write` | Create or modify files | Allowed path prefixes | Sometimes | Local Policy Enforcer, Local Tool Runtime |
-| `File.Delete` | Delete files | Allowed path prefixes | Usually yes | Local Policy Enforcer, Local Tool Runtime |
-| `Shell.Exec` | Run local commands | Command allowlist and cwd paths | Often yes | Local Policy Enforcer, Local Tool Runtime |
-| `Network.Http` | Outbound HTTP requests | Domain allowlist | Sometimes | Local Policy Enforcer, Local Tool Runtime |
-| `Git.Status` | Read repo status | Repo path | Usually no | Local Policy Enforcer, Local Tool Runtime |
-| `Git.Diff` | Read repo diff | Repo path | Usually no | Local Policy Enforcer, Local Tool Runtime |
-| `Git.Commit` | Create commits | Repo path and branch policy | Usually yes | Local Policy Enforcer, Local Tool Runtime |
-| `Git.Push` | Push commits | Repo path and remote allowlist | Yes | Local Policy Enforcer, Local Tool Runtime |
-| `Workspace.Upload` | Upload artifacts | Workspace id and size limits | Usually no | Local Agent Host |
-| `BackendTool.Invoke` | Invoke remote-only tools | Tool names | Sometimes | Local Agent Host, Policy Service |
-| `LLM.Call` | Call LLM Gateway | Model allowlist and token budgets | No | LLM Gateway, Policy Service |
+| Capability           | Description              | Typical Scope                     | Approval Required | Enforced By                               |
+| -------------------- | ------------------------ | --------------------------------- | ----------------- | ----------------------------------------- |
+| `File.Read`          | Read file contents       | Allowed path prefixes             | Usually no        | Local Policy Enforcer, Local Tool Runtime |
+| `File.Write`         | Create or modify files   | Allowed path prefixes             | Sometimes         | Local Policy Enforcer, Local Tool Runtime |
+| `File.Delete`        | Delete files             | Allowed path prefixes             | Usually yes       | Local Policy Enforcer, Local Tool Runtime |
+| `Shell.Exec`         | Run local commands       | Command allowlist and cwd paths   | Often yes         | Local Policy Enforcer, Local Tool Runtime |
+| `Network.Http`       | Outbound HTTP requests   | Domain allowlist                  | Sometimes         | Local Policy Enforcer, Local Tool Runtime |
+| `Git.Status`         | Read repo status         | Repo path                         | Usually no        | Local Policy Enforcer, Local Tool Runtime |
+| `Git.Diff`           | Read repo diff           | Repo path                         | Usually no        | Local Policy Enforcer, Local Tool Runtime |
+| `Git.Commit`         | Create commits           | Repo path and branch policy       | Usually yes       | Local Policy Enforcer, Local Tool Runtime |
+| `Git.Push`           | Push commits             | Repo path and remote allowlist    | Yes               | Local Policy Enforcer, Local Tool Runtime |
+| `Workspace.Upload`   | Upload artifacts         | Workspace id and size limits      | Usually no        | Local Agent Host                          |
+| `BackendTool.Invoke` | Invoke remote-only tools | Tool names                        | Sometimes         | Local Agent Host, Policy Service          |
+| `LLM.Call`           | Call LLM Gateway         | Model allowlist and token budgets | No                | LLM Gateway, Policy Service               |
 
 ### Scope Examples
+
 Scope fields can include:
+
 - `allowedPaths`
 - `blockedPaths`
 - `allowedCommands`
@@ -536,7 +700,9 @@ The **Policy Service** returns a signed policy bundle during session handshake.
 ```
 
 ### Validation Rules
+
 **Local Agent Host** must validate:
+
 - signature
 - expiry
 - session id match
@@ -551,6 +717,7 @@ If validation fails, the session must not start.
 Use **JSON-RPC 2.0** between **Desktop App** and **Local Agent Host** over stdio or local socket.
 
 ### JSON-RPC Methods
+
 - `CreateSession`
 - `StartTask`
 - `CancelTask`
@@ -650,6 +817,7 @@ Use **JSON-RPC 2.0** between **Desktop App** and **Local Agent Host** over stdio
 ## 12) Backend API Payload Examples
 
 ### 12.1 Session Service Create Session
+
 `POST /sessions`
 
 ```json
@@ -687,6 +855,7 @@ Use **JSON-RPC 2.0** between **Desktop App** and **Local Agent Host** over stdio
 ```
 
 ### 12.2 LLM Gateway Stream Request
+
 `POST /llm/stream`
 
 ```json
@@ -720,6 +889,7 @@ Use **JSON-RPC 2.0** between **Desktop App** and **Local Agent Host** over stdio
 ```
 
 ### 12.3 Approval Service Persist Decision
+
 `POST /approvals/{approvalId}/decision`
 
 ```json
@@ -734,6 +904,7 @@ Use **JSON-RPC 2.0** between **Desktop App** and **Local Agent Host** over stdio
 ```
 
 ### 12.4 Workspace Service Upload Artifact
+
 `POST /workspaces/{workspaceId}/artifacts`
 
 ```json
@@ -889,6 +1060,7 @@ Use one envelope shape across services.
 ```
 
 ### Allowed component values
+
 - `DesktopApp`
 - `LocalAgentHost`
 - `LocalToolRuntime`
@@ -904,6 +1076,7 @@ Use one envelope shape across services.
 - `BackendToolService`
 
 ### Allowed boundedContext values
+
 - `AgentExecution`
 - `ToolExecution`
 - `PolicyGuardrails`
@@ -933,6 +1106,7 @@ Define a consistent error shape across local IPC and backend APIs.
 ```
 
 ### Recommended error codes
+
 - `INVALID_REQUEST`
 - `UNAUTHORIZED`
 - `SESSION_NOT_FOUND`
@@ -955,9 +1129,11 @@ Define a consistent error shape across local IPC and backend APIs.
 ## 16) Interfaces and APIs Summary
 
 ### Local IPC
+
 JSON-RPC 2.0 over stdio or local socket
 
 ### Remote APIs
+
 - **Session Service**
   - `POST /sessions`
   - `POST /sessions/{sessionId}/resume`
@@ -986,7 +1162,9 @@ JSON-RPC 2.0 over stdio or local socket
 ## 17) Security Model
 
 ### Local Controls
+
 Enforced by **Local Policy Enforcer** and **Local Tool Runtime**
+
 - path allowlists
 - command restrictions
 - capability checks
@@ -995,7 +1173,9 @@ Enforced by **Local Policy Enforcer** and **Local Tool Runtime**
 - source provenance tagging
 
 ### Central LLM Controls
+
 Enforced by **LLM Gateway** and **Policy Service**
+
 - prompt guardrails
 - response guardrails
 - model allowlists
@@ -1004,6 +1184,7 @@ Enforced by **LLM Gateway** and **Policy Service**
 - audit metadata
 
 ### Policy Distribution
+
 - policy bundle fetched at session start
 - policy bundle signed by Policy Service
 - Local Agent Host validates signature before use
@@ -1013,6 +1194,7 @@ Enforced by **LLM Gateway** and **Policy Service**
 ## 18) Observability and Audit
 
 ### Standard Event Names
+
 - `session_created`
 - `session_started`
 - `step_started`
@@ -1026,7 +1208,9 @@ Enforced by **LLM Gateway** and **Policy Service**
 - `session_failed`
 
 ### Trace Boundaries
+
 Align spans to bounded contexts:
+
 - Agent Execution
 - Tool Execution
 - Policy and Guardrails
@@ -1036,7 +1220,9 @@ Align spans to bounded contexts:
 - Session Coordination
 
 ### Audit Records
+
 At minimum:
+
 - approvals
 - high-risk tool invocations
 - LLM request and response metadata
@@ -1048,47 +1234,62 @@ At minimum:
 ## 19) Gaps and Risk Areas
 
 ### 19.1 Local Loop Durability
+
 Risk:
+
 - crash or sleep interrupts long tasks
 
 Mitigation:
+
 - Local State Store checkpoints
 - idempotent tool contracts
 - session resume support
 
 ### 19.2 Version Skew
+
 Risk:
+
 - local runtime and backend policy mismatch
 
 Mitigation:
+
 - compatibility checks in Session Service
 - policy schema versioning
 - feature flags
 
 ### 19.3 Cross Platform Differences
+
 Risk:
+
 - Windows and macOS tool behavior diverges
 
 Mitigation:
+
 - per-platform adapters in Local Tool Runtime
 - strict tool schemas
 - capability discovery during handshake
 
 ### 19.4 Prompt Injection From Local Content
+
 Risk:
+
 - malicious repo content influences the agent
 
 Mitigation:
+
 - provenance tagging in Local Policy Enforcer
 - redaction rules
 - LLM Gateway guardrails
 - approval for risky actions
 
 ### 19.5 Overusing WebSocket Too Early
+
 Risk:
+
 - complexity without need
 
 Mitigation:
+
 - start with REST and HTTP streaming
 - add WebSocket only for server push use cases
 
@@ -1097,6 +1298,7 @@ Mitigation:
 ## 20) Implementation Phasing for Desktop
 
 ### Phase 1
+
 - Desktop App
 - Local Agent Host
 - Local Tool Runtime
@@ -1108,6 +1310,7 @@ Mitigation:
 - basic Telemetry Service
 
 ### Phase 2
+
 - Local Approval UI
 - Approval Service
 - Local State Store checkpoints and resume
@@ -1115,12 +1318,14 @@ Mitigation:
 - compatibility handshake
 
 ### Phase 3
+
 - remote-only tool support via Backend Tool Service
 - stronger guardrails
 - richer telemetry
 - policy revocation and optional server push
 
 ### Phase 4
+
 - scale hardening
 - quotas and budgets
 - performance tuning
@@ -1133,9 +1338,11 @@ Mitigation:
 This section is intentionally separate from the desktop-first design.
 
 ### Web Mode Adaptation
+
 Because the browser cannot safely run the same local tool model, run the same logical agent runtime in a backend sandbox.
 
 Changes from desktop:
+
 - **Local Agent Host** becomes **Sandbox Agent Host**
 - **Local Tool Runtime** becomes **Sandbox Tool Runtime**
 - **Local State Store** becomes **Sandbox State Store**
@@ -1213,7 +1420,9 @@ sequenceDiagram
 ```
 
 ### Why the same design still works
+
 Desktop and web share:
+
 - state machine
 - event names
 - tool schemas
@@ -1229,6 +1438,7 @@ Only the runtime location changes.
 WebSocket is optional and not needed for v1 desktop.
 
 If added later, use it only for server push cases:
+
 - remote admin stop
 - live observer mode
 - policy revocation
@@ -1241,6 +1451,7 @@ Reuse the same `SessionEvent` schema for WebSocket messages.
 ## 23) Protocol Package Guidance for Implementation
 
 To keep generated code and hand-written code aligned, maintain a shared `protocol` package with:
+
 - `session_event.schema.json`
 - `tool_request.schema.json`
 - `tool_result.schema.json`
@@ -1261,6 +1472,7 @@ This section maps bounded contexts and components to repositories so coding agen
 ### 24.1 Repo Layout Overview
 
 Recommended repositories:
+
 - `desktop-app`
 - `local-agent-host`
 - `local-tool-runtime`
@@ -1281,31 +1493,34 @@ If you prefer fewer repos, the backend services can be grouped into one monorepo
 
 ### 24.2 Repo to Bounded Context Mapping
 
-| Repo | Primary Bounded Context | Owned Components |
-|---|---|---|
-| `desktop-app` | AgentExecution UI surface | Desktop App, Local Approval UI presentation shell |
-| `local-agent-host` | AgentExecution | Local Agent Host, Local State Store |
-| `local-tool-runtime` | ToolExecution | Local Tool Runtime, platform adapters |
-| `backend-session-service` | SessionCoordination | Session Service |
-| `backend-llm-gateway` | PolicyGuardrails | LLM Gateway |
-| `backend-policy-service` | PolicyGuardrails | Policy Service |
-| `backend-approval-service` | Approval | Approval Service |
-| `backend-workspace-service` | WorkspaceArtifacts | Workspace Service, storage adapters |
-| `backend-audit-service` | ObservabilityAudit | Audit Service |
-| `backend-telemetry-service` | ObservabilityAudit | Telemetry Service |
-| `backend-tool-service` | ToolExecution | Backend Tool Service |
-| `protocol-contracts` | Shared contract layer | Schemas, event names, JSON-RPC method contracts |
-| `shared-sdk` | Shared integration code | Generated clients, auth helpers, event envelope helpers |
-| `infra-platform` | Deployment and operations | IaC, CI CD, secrets wiring, runtime infra |
-| `docs-architecture` | Architecture documentation | Design docs, ADRs, diagrams, runbooks |
+| Repo                        | Primary Bounded Context    | Owned Components                                        |
+| --------------------------- | -------------------------- | ------------------------------------------------------- |
+| `desktop-app`               | AgentExecution UI surface  | Desktop App, Local Approval UI presentation shell       |
+| `local-agent-host`          | AgentExecution             | Local Agent Host, Local State Store                     |
+| `local-tool-runtime`        | ToolExecution              | Local Tool Runtime, platform adapters                   |
+| `backend-session-service`   | SessionCoordination        | Session Service                                         |
+| `backend-llm-gateway`       | PolicyGuardrails           | LLM Gateway                                             |
+| `backend-policy-service`    | PolicyGuardrails           | Policy Service                                          |
+| `backend-approval-service`  | Approval                   | Approval Service                                        |
+| `backend-workspace-service` | WorkspaceArtifacts         | Workspace Service, storage adapters                     |
+| `backend-audit-service`     | ObservabilityAudit         | Audit Service                                           |
+| `backend-telemetry-service` | ObservabilityAudit         | Telemetry Service                                       |
+| `backend-tool-service`      | ToolExecution              | Backend Tool Service                                    |
+| `protocol-contracts`        | Shared contract layer      | Schemas, event names, JSON-RPC method contracts         |
+| `shared-sdk`                | Shared integration code    | Generated clients, auth helpers, event envelope helpers |
+| `infra-platform`            | Deployment and operations  | IaC, CI CD, secrets wiring, runtime infra               |
+| `docs-architecture`         | Architecture documentation | Design docs, ADRs, diagrams, runbooks                   |
 
 ### 24.3 Detailed Repo Responsibilities
 
 #### `desktop-app`
+
 **Purpose**
+
 - User-facing desktop application shell for macOS and Windows
 
 **Owns**
+
 - Desktop UI screens
 - Session launch and stop UI
 - Approval dialogs and patch preview UI
@@ -1313,11 +1528,13 @@ If you prefer fewer repos, the backend services can be grouped into one monorepo
 - Local process lifecycle management for Local Agent Host
 
 **Does Not Own**
+
 - Agent loop logic
 - Tool execution implementation
 - Policy evaluation logic
 
 **Suggested folders**
+
 - `src/ui`
 - `src/ipc`
 - `src/session`
@@ -1326,10 +1543,13 @@ If you prefer fewer repos, the backend services can be grouped into one monorepo
 - `src/platform`
 
 #### `local-agent-host`
+
 **Purpose**
+
 - Local runtime process that hosts the agent loop
 
 **Owns**
+
 - Agent loop state machine
 - Planning and step orchestration
 - Session checkpointing in Local State Store
@@ -1337,11 +1557,13 @@ If you prefer fewer repos, the backend services can be grouped into one monorepo
 - Event generation and local JSON-RPC server
 
 **Does Not Own**
+
 - Desktop UI rendering
 - Tool execution internals
 - Central policy authoring
 
 **Suggested folders**
+
 - `agent_loop`
 - `ipc_server`
 - `session_client`
@@ -1353,10 +1575,13 @@ If you prefer fewer repos, the backend services can be grouped into one monorepo
 - `events`
 
 #### `local-tool-runtime`
+
 **Purpose**
+
 - Local tool execution engine with per-platform adapters
 
 **Owns**
+
 - File tools
 - Shell command tools
 - Git tools
@@ -1365,11 +1590,13 @@ If you prefer fewer repos, the backend services can be grouped into one monorepo
 - OS-specific command and path handling
 
 **Does Not Own**
+
 - Agent loop orchestration
 - Approval persistence
 - LLM calls
 
 **Suggested folders**
+
 - `tools/file`
 - `tools/shell`
 - `tools/git`
@@ -1380,10 +1607,13 @@ If you prefer fewer repos, the backend services can be grouped into one monorepo
 - `tool_schemas`
 
 #### `backend-session-service`
+
 **Purpose**
+
 - Session creation, resume, compatibility checks, and metadata
 
 **Owns**
+
 - Session APIs
 - Capability handshake processing
 - Version compatibility policy
@@ -1391,15 +1621,19 @@ If you prefer fewer repos, the backend services can be grouped into one monorepo
 - Session status transitions
 
 **Does Not Own**
+
 - LLM request processing
 - Tool execution
 - Artifact storage internals
 
 #### `backend-llm-gateway`
+
 **Purpose**
+
 - Centralized model access and guardrail enforcement point
 
 **Owns**
+
 - LLM streaming endpoints
 - Request and response guardrail invocation
 - Model routing
@@ -1407,15 +1641,19 @@ If you prefer fewer repos, the backend services can be grouped into one monorepo
 - LLM request audit metadata emission
 
 **Does Not Own**
+
 - Session creation
 - Tool execution
 - Policy authoring rules source
 
 #### `backend-policy-service`
+
 **Purpose**
+
 - Policy authoring, policy resolution, and signed policy bundles
 
 **Owns**
+
 - Policy bundle generation
 - Capability policy definitions
 - Approval rule definitions
@@ -1423,84 +1661,108 @@ If you prefer fewer repos, the backend services can be grouped into one monorepo
 - LLM guardrail policy configuration
 
 **Does Not Own**
+
 - LLM provider connectivity
 - Tool execution
 - Workspace storage
 
 #### `backend-approval-service`
+
 **Purpose**
+
 - Approval decision persistence and retrieval
 
 **Owns**
+
 - Approval record APIs
 - Approval lifecycle state
 - Audit hooks for decisions
 
 **Does Not Own**
+
 - Approval UI rendering
 - Tool execution
 - Agent loop state machine
 
 #### `backend-workspace-service`
+
 **Purpose**
+
 - Artifact and checkpoint metadata plus storage access APIs
 
 **Owns**
+
 - Workspace manifests
 - Artifact upload and retrieval APIs
 - Checkpoint references
 - Metadata store and artifact store adapters
 
 **Does Not Own**
+
 - Agent planning
 - Policy decisions
 - Audit decisions
 
 #### `backend-audit-service`
+
 **Purpose**
+
 - Immutable or append-only audit events for security and compliance
 
 **Owns**
+
 - Audit event ingest APIs
 - Audit storage model
 - Query interfaces for audit review
 
 **Does Not Own**
+
 - Tracing and metrics aggregation
 - Agent execution logic
 
 #### `backend-telemetry-service`
+
 **Purpose**
+
 - Telemetry ingest and trace processing
 
 **Owns**
+
 - Telemetry event APIs
 - Trace ingestion
 - Metrics aggregation pipeline integration
 
 **Does Not Own**
+
 - Security audit retention policies
 - Business workflow orchestration
 
 #### `backend-tool-service` (optional)
+
 **Purpose**
+
 - Remote-only tools for capabilities not available or not allowed locally
 
 **Owns**
+
 - Tool workers and APIs for remote tools
 - Workspace output integration
 - Telemetry and audit hooks for remote tools
 
 **Does Not Own**
+
 - Local tool execution
 - Session handshake
 - LLM governance
 
 #### `protocol-contracts`
+
 **Purpose**
+
 - Single source of truth for protocol definitions and schemas
 
 **Owns**
+
 - JSON schemas
 - JSON-RPC method contracts
 - Event names and envelope spec
@@ -1508,15 +1770,19 @@ If you prefer fewer repos, the backend services can be grouped into one monorepo
 - Capability names and field definitions
 
 **Does Not Own**
+
 - Runtime business logic
 - UI code
 - Service deployment code
 
 #### `shared-sdk` (optional but recommended)
+
 **Purpose**
+
 - Reusable client libraries generated or hand-written from `protocol-contracts`
 
 **Owns**
+
 - Session Service client
 - LLM Gateway client
 - Approval Service client
@@ -1525,14 +1791,18 @@ If you prefer fewer repos, the backend services can be grouped into one monorepo
 - Error parsing and retry helpers
 
 **Does Not Own**
+
 - Service implementations
 - Policy rules
 
 #### `infra-platform`
+
 **Purpose**
+
 - Infrastructure, deployment, and operations automation
 
 **Owns**
+
 - Terraform or equivalent IaC
 - CI CD templates
 - secrets and key management integration
@@ -1540,14 +1810,18 @@ If you prefer fewer repos, the backend services can be grouped into one monorepo
 - observability infrastructure wiring
 
 **Does Not Own**
+
 - Product business logic
 - protocol definitions
 
 #### `docs-architecture`
+
 **Purpose**
+
 - Architecture source of truth and ADRs
 
 **Owns**
+
 - This design doc
 - ADRs
 - runbooks
@@ -1559,72 +1833,6 @@ If you prefer fewer repos, the backend services can be grouped into one monorepo
 Use these rules to prevent tight coupling.
 
 #### Allowed dependencies
+
 - `desktop-app` -> `protocol-contracts`, `shared-sdk`
-- `local-agent-host` -> `protocol-contracts`, `shared-sdk`
-- `local-tool-runtime` -> `protocol-contracts`
-- backend services -> `protocol-contracts`, `shared-sdk`
-- `shared-sdk` -> `protocol-contracts`
-- `docs-architecture` -> no code dependency
-
-#### Not allowed
-- `desktop-app` must not import backend service implementation code
-- `local-tool-runtime` must not import `desktop-app`
-- backend services must not import `desktop-app` or `local-agent-host`
-- `protocol-contracts` must not depend on any implementation repo
-
-### 24.5 Monorepo Alternative
-
-If your team prefers a monorepo, keep the same boundaries as top-level folders:
-- `apps/desktop-app`
-- `apps/local-agent-host`
-- `apps/local-tool-runtime`
-- `services/session-service`
-- `services/llm-gateway`
-- `services/policy-service`
-- `services/approval-service`
-- `services/workspace-service`
-- `services/audit-service`
-- `services/telemetry-service`
-- `services/backend-tool-service`
-- `packages/protocol-contracts`
-- `packages/shared-sdk`
-- `infra`
-- `docs`
-
-The key requirement is boundary discipline, not repo count.
-
-### 24.6 Coding Agent Friendly Work Allocation
-
-This mapping is optimized for parallel coding agent work.
-
-#### Wave 1
-- `protocol-contracts`
-- `backend-session-service`
-- `backend-policy-service`
-- `backend-llm-gateway`
-- `local-agent-host` skeleton
-- `desktop-app` JSON-RPC client shell
-
-#### Wave 2
-- `local-tool-runtime`
-- `backend-workspace-service`
-- `backend-approval-service`
-- `backend-audit-service`
-- `backend-telemetry-service`
-
-#### Wave 3
-- `desktop-app` UX flows
-- `local-agent-host` checkpoint and resume
-- `shared-sdk`
-- `backend-tool-service` optional remote tools
-
-### 24.7 Definition of Done for Repo Boundaries
-
-A repo boundary is healthy when:
-- imports only flow through allowed dependency directions
-- all external communication uses `protocol-contracts` schemas
-- each repo has its own tests and lint rules
-- no component naming drift exists from this design doc
-- API surface is documented in the repo README
-- observability emits `component` and `boundedContext` fields consistently
-
+- `local-agent-host`
