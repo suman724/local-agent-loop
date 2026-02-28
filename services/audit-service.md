@@ -4,7 +4,7 @@
 > The Audit Service is planned but not required for Phase 1 or 2. It should be designed and built in Phase 3 alongside stronger governance features. References in other service docs to `POST /audit/events` should be treated as no-ops or logged locally until this service exists.
 
 **Phase:** 3
-**Repo:** `backend-observability` (`audit/` package)
+**Repo:** `cowork-observability` (`audit/` package)
 **Bounded Context:** ObservabilityAudit
 
 ---

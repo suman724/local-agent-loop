@@ -1,6 +1,6 @@
 # Local Tool Runtime — Component Design
 
-**Repo:** `agent-runtime` (`tool-runtime/` package)
+**Repo:** `cowork-agent-runtime` (`tool_runtime/` package)
 **Bounded Context:** ToolExecution
 **Phase:** 1 (MVP); MCP client in Phase 2+
 

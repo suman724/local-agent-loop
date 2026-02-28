@@ -1,7 +1,7 @@
 # Policy Service — Detailed Design
 
 **Phase:** 1 (MVP)
-**Repo:** `backend-policy`
+**Repo:** `cowork-policy-service`
 **Bounded Context:** PolicyGuardrails
 
 ---

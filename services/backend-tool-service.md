@@ -4,7 +4,7 @@
 > The Backend Tool Service is optional and planned for Phase 3. It is not required for Phase 1 or Phase 2. All tool execution in Phase 1 and Phase 2 happens locally via the Local Tool Runtime.
 
 **Phase:** 3 (optional)
-**Repo:** `backend-tools`
+**Repo:** `cowork-backend-tools`
 **Bounded Context:** ToolExecution
 
 ---

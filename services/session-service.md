@@ -1,7 +1,7 @@
 # Session Service — Detailed Design
 
 **Phase:** 1 (MVP)
-**Repo:** `backend-session`
+**Repo:** `cowork-session-service`
 **Bounded Context:** SessionCoordination
 
 ---

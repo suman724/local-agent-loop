@@ -4,7 +4,7 @@
 > The Telemetry Service is planned but not required for Phase 1 or 2. A basic implementation may be added in Phase 3 alongside stronger observability features. References in other service docs to `POST /telemetry/events` and `POST /telemetry/traces` should be treated as no-ops or logged locally until this service exists.
 
 **Phase:** 3
-**Repo:** `backend-observability` (`telemetry/` package)
+**Repo:** `cowork-observability` (`telemetry/` package)
 **Bounded Context:** ObservabilityAudit
 
 ---

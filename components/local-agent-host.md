@@ -1,6 +1,6 @@
 # Local Agent Host — Component Design
 
-**Repo:** `agent-runtime` (`agent-host/` package)
+**Repo:** `cowork-agent-runtime` (`agent_host/` package)
 **Bounded Context:** AgentExecution
 **Phase:** 1 (MVP)
 **Covers:** Local Agent Host, Local Policy Enforcer, Local State Store
@@ -38,7 +38,7 @@ This document describes the internal design of the `agent-host/` package. It cov
 
 ### Key constraint
 
-**One session per OS process.** The Desktop App spawns one `agent-runtime` process per session. The process exits when the session ends. This simplifies concurrency — there is no need for session multiplexing, session isolation, or shared memory between sessions.
+**One session per OS process.** The Desktop App spawns one `cowork-agent-runtime` process per session. The process exits when the session ends. This simplifies concurrency — there is no need for session multiplexing, session isolation, or shared memory between sessions.
 
 ### Component Context
 

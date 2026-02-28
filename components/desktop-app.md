@@ -1,15 +1,15 @@
 # Desktop App — Component Design
 
-**Repo:** `desktop` (`app/` and `updater/` packages)
+**Repo:** `cowork-desktop-app` (`app/` and `updater/` packages)
 **Bounded Context:** AgentExecution (UI)
 **Phase:** 1 (MVP)
 **Covers:** Desktop App, Local Approval UI
 
 ---
 
-The Desktop App is the user-facing application for Windows and macOS. It provides the conversation interface, renders approval dialogs, previews file changes, and manages the `agent-runtime` lifecycle. It communicates with the Local Agent Host exclusively via JSON-RPC 2.0 — it never imports agent-runtime code directly.
+The Desktop App is the user-facing application for Windows and macOS. It provides the conversation interface, renders approval dialogs, previews file changes, and manages the `cowork-agent-runtime` lifecycle. It communicates with the Local Agent Host exclusively via JSON-RPC 2.0 — it never imports agent-runtime code directly.
 
-This document describes the internal design of the `desktop/` repo. For the agent loop, see [local-agent-host.md](local-agent-host.md). For tool execution, see [local-tool-runtime.md](local-tool-runtime.md).
+This document describes the internal design of the `cowork-desktop-app/` repo. For the agent loop, see [local-agent-host.md](local-agent-host.md). For tool execution, see [local-tool-runtime.md](local-tool-runtime.md).
 
 **Prerequisites:** [architecture.md](../architecture.md) (architecture, protocol contracts), [domain-model.md](../domain-model.md) (session, task, workspace concepts)
 
@@ -37,8 +37,8 @@ This document describes the internal design of the `desktop/` repo. For the agen
 
 ### Key constraints
 
-- **No direct imports from `agent-runtime`** — all communication is via JSON-RPC over stdio or local socket
-- **Depends only on `platform`** — for JSON-RPC method names, error codes, and event types
+- **No direct imports from `cowork-agent-runtime`** — all communication is via JSON-RPC over stdio or local socket
+- **Depends only on `cowork-platform`** — for JSON-RPC method names, error codes, and event types
 - **Cross-platform** — must work on macOS and Windows with the same codebase
 
 ### Component Context

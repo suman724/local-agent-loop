@@ -470,9 +470,76 @@ API contracts, data models, and implementation notes:
 
 ---
 
-## 8. Storage Strategy
+## 8. Technology Stack
 
-### Production stores
+### Languages and frameworks
+
+| Layer | Technology | Language |
+|-------|-----------|----------|
+| Desktop App UI | Electron, React | TypeScript |
+| Agent Host | asyncio, httpx, Pydantic | Python |
+| Tool Runtime | asyncio, subprocess, pathlib, Pydantic | Python |
+| Backend Services | FastAPI, PynamoDB | Python |
+| Shared Contracts | JSON Schema (source of truth) | Language-independent |
+| Contract Bindings — Python | Pydantic models (generated via `datamodel-code-generator`) | Python |
+| Contract Bindings — TypeScript | TypeScript interfaces (generated via `json-schema-to-typescript`) | TypeScript |
+
+### Why these choices
+
+- **Python for all business logic** (backend + agent-runtime): the team is Python-heavy, and using one language for the agent loop, tool execution, policy enforcement, and backend services maximizes code sharing, simplifies code review, and keeps hiring focused. The agent loop is I/O-bound (LLM streaming, file ops, shell commands) — Python's `asyncio` handles this well.
+- **TypeScript only for the Electron UI shell**: the Desktop App is a frontend (React components, approval dialogs, patch preview). TypeScript is the natural fit for Electron. No business logic lives here — it delegates everything to the agent-runtime over JSON-RPC.
+- **JSON Schema as the contract boundary**: language-independent source of truth. Generates Pydantic models for Python consumers and TypeScript interfaces for the Desktop App. A schema change triggers codegen → publishes updated packages → all consumers import the new version. No manual type duplication, no drift.
+
+### Shared contracts strategy
+
+The `platform/` repo holds the source-of-truth schemas and generates typed bindings for each language:
+
+```
+platform/contracts/schemas/tool-request.json     ← source of truth
+                                  ↓ codegen
+platform/generated/python/models/tool_request.py  ← Pydantic model (pip package)
+platform/generated/typescript/ToolRequest.ts       ← TS interface (npm package)
+```
+
+Since backend services and agent-runtime are both Python, they share the **same pip package** — one generated Pydantic library covers both. TypeScript generation is only needed for the Desktop App.
+
+### Agent-runtime packaging
+
+The agent-runtime is a Python process. End users never install Python — the runtime is packaged for them:
+
+- **Phase 1:** Ships bundled inside the Electron installer with an embedded Python runtime. The Desktop App spawns the agent-runtime as a child process. No external dependencies.
+- **Phase 4:** Compiled to a standalone binary via PyApp or Nuitka for independent download. Self-contained, no Python installation required on the machine.
+
+---
+
+## 9. Infrastructure
+
+### Compute
+
+All backend services run on **AWS ECS** (Elastic Container Service) with Fargate launch type — no EC2 instance management.
+
+| Service | ECS Service | Phase | Notes |
+|---------|------------|-------|-------|
+| Session Service | `{env}-session` | 1 | Always running — entry point for all sessions |
+| Policy Service | `{env}-policy` | 1 | Always running — called by Session Service at session creation |
+| Workspace Service | `{env}-workspace` | 1 | Always running — artifact uploads during and after tasks |
+| Approval Service | `{env}-approval` | 2 | Always running — receives approval decisions |
+| Audit Service | `{env}-audit` | 3 | Always running — append-only event ingest |
+| Telemetry Service | `{env}-telemetry` | 3 | Always running — trace and metric ingest |
+| Backend Tool Service | `{env}-backend-tools` | 3 | Always running — remote tool execution |
+
+Each service is a **FastAPI application** packaged as a Docker container. One ECS service per backend service — they scale independently.
+
+**Networking:**
+- Services sit behind an **Application Load Balancer (ALB)** with path-based routing (`/sessions/*`, `/workspaces/*`, `/approvals/*`, etc.)
+- Inter-service calls (e.g., Session Service → Policy Service) go through the ALB or via **ECS Service Connect** for service-to-service discovery
+- The Desktop App's agent-runtime connects to the ALB endpoint over HTTPS
+
+**Environments:**
+- `dev`, `staging`, `prod` — each is a separate ECS cluster with its own ALB, DynamoDB tables, and S3 buckets
+- Environment is passed as a container environment variable and used to prefix all resource names
+
+### Storage
 
 | Store | Technology | Used by |
 |-------|-----------|---------|
@@ -529,7 +596,7 @@ All tables follow these conventions:
 
 ---
 
-## 9. Implementation Phasing
+## 10. Implementation Phasing
 
 ### Phase 1 — Core desktop agent
 
@@ -547,11 +614,11 @@ Audit Service, Telemetry Service, Backend Tool Service (optional), stronger LLM 
 
 Scale hardening, quotas and budgets, performance tuning, skills layer (formalize recurring tool sequences once patterns are understood)
 
-Separate agent-runtime download — Desktop App downloads and manages `agent-runtime` (Local Agent Host + Local Tool Runtime) as an independently versioned component. This allows agent loop improvements to ship without a full desktop app release. See [Section 11](#11-repo-mapping) for the download architecture.
+Separate agent-runtime download — Desktop App downloads and manages `cowork-agent-runtime` (Local Agent Host + Local Tool Runtime) as an independently versioned component. This allows agent loop improvements to ship without a full desktop app release. See [Section 12](#12-repo-mapping) for the download architecture.
 
 ---
 
-## 10. Risks
+## 11. Risks
 
 | Risk | Mitigation |
 |------|-----------|
@@ -564,38 +631,38 @@ Separate agent-runtime download — Desktop App downloads and manages `agent-run
 
 ---
 
-## 11. Repo Mapping
+## 12. Repo Mapping
 
 ### Repos
 
-| Repo | Contains | Bounded Context(s) |
-|------|----------|--------------------|
-| `desktop` | Desktop App (UI shell, component downloader) | AgentExecution (UI) |
-| `agent-runtime` | Local Agent Host, Local Tool Runtime | AgentExecution, ToolExecution |
-| `backend-session` | Session Service | SessionCoordination |
-| `backend-policy` | Policy Service | PolicyGuardrails |
-| `backend-workspace` | Workspace Service, storage adapters | WorkspaceArtifacts |
-| `backend-approval` | Approval Service | Approval |
-| `backend-observability` | Audit Service, Telemetry Service | ObservabilityAudit |
-| `backend-tools` | Backend Tool Service (Phase 3, optional) | ToolExecution |
-| `platform` | Protocol contracts, shared SDK | Shared |
-| `infra` | IaC, CI/CD, secrets management, architecture docs | Operations |
+| Repo | Contains | Language | Bounded Context(s) |
+|------|----------|----------|---------------------|
+| `cowork-desktop-app` | Desktop App (Electron UI, component downloader) | TypeScript | AgentExecution (UI) |
+| `cowork-agent-runtime` | Local Agent Host, Local Tool Runtime | Python | AgentExecution, ToolExecution |
+| `cowork-session-service` | Session Service (FastAPI) | Python | SessionCoordination |
+| `cowork-policy-service` | Policy Service (FastAPI) | Python | PolicyGuardrails |
+| `cowork-workspace-service` | Workspace Service (FastAPI), storage adapters | Python | WorkspaceArtifacts |
+| `cowork-approval-service` | Approval Service (FastAPI) | Python | Approval |
+| `cowork-observability` | Audit Service, Telemetry Service (FastAPI) | Python | ObservabilityAudit |
+| `cowork-backend-tools` | Backend Tool Service (FastAPI, Phase 3, optional) | Python | ToolExecution |
+| `cowork-platform` | JSON Schema contracts, generated bindings, SDK | Python + TypeScript | Shared |
+| `cowork-infra` | IaC, CI/CD, secrets management, architecture docs | — | Operations |
 
 ### Why these boundaries
 
-**`desktop` and `agent-runtime` are separate** so that agent loop improvements can ship without a new desktop app release. The Desktop App downloads and manages `agent-runtime` as an independently versioned component — see [Agent-runtime download model](#agent-runtime-download-model) below.
+**`cowork-desktop-app` and `cowork-agent-runtime` are separate** so that agent loop improvements can ship without a new desktop app release. The Desktop App downloads and manages `cowork-agent-runtime` as an independently versioned component — see [Agent-runtime download model](#agent-runtime-download-model) below.
 
-**`backend-policy` is separate from `backend-session`** because they have different change rates and concerns. Policy rules (capability definitions, approval requirements, LLM guardrails) are authored and updated by an admin or platform team independently of session lifecycle code. Keeping them in separate repos lets each evolve and deploy without coupling.
+**`cowork-policy-service` is separate from `cowork-session-service`** because they have different change rates and concerns. Policy rules (capability definitions, approval requirements, LLM guardrails) are authored and updated by an admin or platform team independently of session lifecycle code. Keeping them in separate repos lets each evolve and deploy without coupling.
 
-**`backend-observability`** — Audit Service and Telemetry Service share the same bounded context, are both Phase 3, and are complementary fire-and-forget ingest services operated by the same team.
+**`cowork-observability`** — Audit Service and Telemetry Service share the same bounded context, are both Phase 3, and are complementary fire-and-forget ingest services operated by the same team.
 
-**`platform`** — Protocol contracts and the shared SDK evolve together (the SDK is derived from the contracts). Splitting them creates unnecessary synchronisation overhead.
+**`cowork-platform`** — Protocol contracts and the shared SDK evolve together (the SDK is derived from the contracts). Splitting them creates unnecessary synchronisation overhead.
 
-**`infra`** — Infrastructure code and architecture documentation are both owned by the platform team. Neither contains product business logic.
+**`cowork-infra`** — Infrastructure code and architecture documentation are both owned by the platform team. Neither contains product business logic.
 
 ### Agent-runtime download model
 
-The Desktop App and `agent-runtime` have **independent version numbers and release cycles**. The Desktop App acts as a host that downloads, verifies, and launches `agent-runtime` as a managed child process.
+The Desktop App and `cowork-agent-runtime` have **independent version numbers and release cycles**. The Desktop App acts as a host that downloads, verifies, and launches `cowork-agent-runtime` as a managed child process.
 
 ```
 Desktop App (installed)
@@ -616,63 +683,72 @@ Desktop App (installed)
         communication via JSON-RPC over stdio / local socket
 ```
 
-**Version compatibility:** The Session Service compatibility check already validates `localAgentHostVersion` against supported version ranges — this remains the central enforcement point. If an incompatible `agent-runtime` version is detected at session start, the Desktop App is prompted to download a compatible version.
+**Version compatibility:** The Session Service compatibility check already validates `localAgentHostVersion` against supported version ranges — this remains the central enforcement point. If an incompatible `cowork-agent-runtime` version is detected at session start, the Desktop App is prompted to download a compatible version.
 
 **Update flow:**
 - Desktop App checks the version manifest on each launch (or on a background schedule)
-- If a newer compatible `agent-runtime` is available, it downloads it in the background
+- If a newer compatible `cowork-agent-runtime` is available, it downloads it in the background
 - The new version is activated on the next session start — running sessions are not interrupted
 
-**Phase 1 exception:** In Phase 1, `agent-runtime` ships bundled inside the desktop installer for simplicity. The separate download model is introduced in Phase 4 once the interfaces are stable.
+**Phase 1 exception:** In Phase 1, `cowork-agent-runtime` ships bundled inside the Electron installer with an embedded Python runtime. The separate download model is introduced in Phase 4, where `cowork-agent-runtime` is compiled to a standalone binary via PyApp or Nuitka.
 
 ### Folder structure within repos
 
 ```
-desktop/
+cowork-desktop-app/
   app/            ← Desktop App UI (screens, approval dialogs, patch preview)
   updater/        ← agent-runtime version check, download, verification, launch
 
-agent-runtime/
-  agent-host/     ← Local Agent Host (agent loop, session client, LLM client, JSON-RPC server)
-  tool-runtime/   ← Local Tool Runtime (built-in tools, MCP client, platform adapters)
+cowork-agent-runtime/
+  agent_host/     ← Local Agent Host (agent loop, session client, LLM client, JSON-RPC server)
+  tool_runtime/   ← Local Tool Runtime (built-in tools, MCP client, platform adapters)
   build/          ← Platform-specific packaging (macOS arm64/x86_64, Windows x64)
+  pyproject.toml  ← Python project config
 
-backend-observability/
+cowork-observability/
   audit/          ← Audit Service (append-only event ingest, DynamoDB)
   telemetry/      ← Telemetry Service (traces, metrics, OpenTelemetry routing)
 
-platform/
-  contracts/      ← JSON schemas, event names, JSON-RPC method specs, error codes
-  sdk/            ← Generated clients, event envelope helpers, retry helpers
+cowork-platform/
+  contracts/
+    schemas/      ← JSON Schema files (ToolRequest, ToolResult, PolicyBundle, event envelope, etc.)
+    enums/        ← Shared enums (event names, error codes, session states)
+    jsonrpc/      ← JSON-RPC method specs
+  generated/
+    python/       ← Generated Pydantic models (published as pip package)
+    typescript/   ← Generated TypeScript interfaces (published as npm package)
+  sdk/
+    python/       ← Python helpers (event envelope builders, retry, HTTP clients)
+    typescript/   ← TypeScript helpers (JSON-RPC client, event listener)
 
-infra/
-  iac/            ← Terraform / CDK
-  ci/             ← CI/CD templates
+cowork-infra/
+  iac/            ← Terraform / CDK (ECS clusters, ALB, DynamoDB tables, S3 buckets, IAM)
+  ci/             ← CI/CD templates (Docker build, ECS deploy, schema codegen)
   docs/           ← Architecture design docs, ADRs, runbooks, threat models
 ```
 
 ### Dependency rules
 
 **Allowed:**
-- `desktop` → `platform` (for JSON-RPC method names and error codes)
-- `agent-runtime` → `platform`
-- `backend-session` → `platform`
-- `backend-policy` → `platform`
-- `backend-workspace` → `platform`
-- `backend-approval` → `platform`
-- `backend-observability` → `platform`
-- `backend-tools` → `platform`
-- `infra` → all repos (deployment only)
+- `cowork-desktop-app` → `cowork-platform` (TypeScript npm package — JSON-RPC types, error codes)
+- `cowork-agent-runtime` → `cowork-platform` (Python pip package — Pydantic models, helpers)
+- `cowork-session-service` → `cowork-platform` (Python pip package)
+- `cowork-policy-service` → `cowork-platform` (Python pip package)
+- `cowork-workspace-service` → `cowork-platform` (Python pip package)
+- `cowork-approval-service` → `cowork-platform` (Python pip package)
+- `cowork-observability` → `cowork-platform` (Python pip package)
+- `cowork-backend-tools` → `cowork-platform` (Python pip package)
+- `cowork-infra` → all repos (deployment only)
 
 **Prohibited:**
-- `desktop` must not import `agent-runtime` directly — communication is via JSON-RPC over stdio/socket only
-- Components inside `agent-runtime` communicate via the tool routing interface — no direct imports across `agent-host/` and `tool-runtime/` package boundaries
+- `cowork-desktop-app` must not import `cowork-agent-runtime` directly — communication is via JSON-RPC over stdio/socket only
+- Components inside `cowork-agent-runtime` communicate via the tool routing interface — no direct imports across `agent_host/` and `tool_runtime/` package boundaries
 - Backend repos must not import each other — HTTP APIs only
-- `platform/contracts` must not import any service or application repo
+- `cowork-platform/contracts` must not import any service or application repo
 
 ---
 
-## 12. Web Extension
+## 13. Web Extension
 
 The same design works for web by running the agent runtime in a backend sandbox instead of the desktop. Only the runtime location changes — state machine, event names, tool schemas, policy model, and workspace model are all identical.
 

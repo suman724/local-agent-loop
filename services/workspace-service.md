@@ -1,7 +1,7 @@
 # Workspace Service — Detailed Design
 
 **Phase:** 1 (MVP)
-**Repo:** `backend-workspace`
+**Repo:** `cowork-workspace-service`
 **Bounded Context:** WorkspaceArtifacts
 
 ---

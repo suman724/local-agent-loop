@@ -1,7 +1,7 @@
 # Approval Service — Detailed Design
 
 **Phase:** 2
-**Repo:** `backend-approval`
+**Repo:** `cowork-approval-service`
 **Bounded Context:** Approval
 
 ---
