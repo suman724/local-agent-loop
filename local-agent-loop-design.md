@@ -28,7 +28,7 @@ The system is split into two major parts:
 2. **Remote governance and platform services**
 
    - **Session Service** creates and resumes sessions and performs compatibility checks
-   - **Policy Service** generates signed policy bundles and approval rules
+   - **Policy Service** generates policy bundles and approval rules
    - **LLM Gateway** enforces LLM guardrails and routes model requests
    - **Approval Service** persists approval decisions
    - **Workspace Service** stores artifacts and checkpoints using **Artifact Store** and **Metadata Store**
@@ -71,9 +71,11 @@ All LLM requests and responses go through **LLM Gateway**. This is the central e
 - model routing
 - LLM audit metadata
 
+> **Implementation note:** The LLM Gateway is an **existing external service** — it will not be implemented as part of this project. The Local Agent Host integrates with it via a **configurable endpoint URL and configurable auth token**. Both are supplied at session init through the policy bundle returned by the Session Service (or via local configuration for development). No `backend-llm-gateway` repo needs to be built.
+
 #### 3) Capability based security
 
-The system uses a **signed policy bundle** issued by **Policy Service** at session start. Capabilities define what the local agent is allowed to do, such as:
+The system uses a **policy bundle** issued by **Policy Service** at session start. Capabilities define what the local agent is allowed to do, such as:
 
 - file read and write
 - shell execution
@@ -191,6 +193,147 @@ WebSocket is optional later for server-initiated push use cases only.
 
 ---
 
+## 2a) Domain Model: Workspace, Session, Task, Step
+
+This section defines the core domain entities and their relationships. Understanding this hierarchy is essential before reading the component and sequence sections.
+
+### The Hierarchy
+
+```
+Workspace  (always present — auto-created for every session)
+  └── Session  (one or more per workspace, over time)
+        └── Task  (one or more per session)
+              └── Step  (one or more per task)
+                    └── Tool calls, LLM calls, Approvals, Artifacts
+```
+
+### Workspace
+
+A workspace is a **backend namespace** that scopes a session's history and artifacts. Every session has a workspace — it is always auto-created by the Session Service, never explicitly created by the user.
+
+**What a workspace is NOT:**
+- It is not a copy or mirror of the project directory
+- It does not store project source files — those stay on the client machine (for desktop) or in the cloud sandbox (for web)
+
+**What a workspace stores:**
+- Session history snapshots (`session_history` artifacts) — the full conversation thread, uploaded after each task
+- Agent-produced artifacts: tool outputs, generated files, diffs explicitly created by the agent
+
+**Workspace is mandatory for all sessions.** History always goes to the backend so that the Desktop App and the future web client have identical storage behaviour — the Desktop App never relies on the Local State Store for history browsing.
+
+| Session type | Workspace | workspaceScope |
+|---|---|---|
+| Project session (user working in a specific directory) | Auto-resolved from `workspaceHint` (local path) — reused across sessions | `local` |
+| General chat (no project directory) | Auto-created fresh for each session — single-use | `general` |
+| Web session (Phase 3+) | Auto-created or resolved | `cloud` |
+
+**workspaceScope** defines the reuse policy and where source files live:
+
+| Value | Source files | Reuse policy |
+|---|---|---|
+| `local` | Live on the client machine. No project files uploaded to the backend. | Reused across many sessions — one workspace per project, accumulates history over time. |
+| `general` | May exist, scoped to this session only. | Single-use — a new workspace is created for each general chat session. Not shared across sessions. |
+| `cloud` | Live in a cloud sandbox in the backend. | TBD (Phase 3+). |
+
+The key distinction between `local` and `general` is **reuse policy**, not the presence of files. A `general` workspace can hold files and context for that conversation, but when the user starts a new general chat they get a fresh workspace — nothing carries over from a previous general chat.
+
+This is distinct from `executionEnvironment` on the session. `workspaceScope` describes the **workspace reuse and file policy**; `executionEnvironment` describes **where the agent runs**.
+
+**Workspace lifecycle:**
+- `local` workspaces: created once per project, reused across all future sessions on that project — long-lived, accumulates history and artifacts over time
+- `general` workspaces: created fresh for each general chat session — single-use, contains only the history and artifacts for that one session
+- `cloud` workspaces: lifecycle TBD (Phase 3+)
+- **Deletion**: a user can explicitly delete a workspace from the Desktop App; all artifacts and session history under it are permanently removed
+- **Auto-purge**: workspaces inactive for 90 days are automatically purged (implementation deferred to a later phase)
+
+### Session
+
+A session is the **governance container** for one continuous working period. It is also what the user sees as a **conversation** in the Desktop App UI.
+
+- Created when the user opens the Desktop App and begins working
+- Holds the policy bundle, LLM Gateway endpoint and token, token budgets, approval rules, feature flags, and `executionEnvironment` — all scoped to this working period
+- Runs the agent loop state machine and owns the in-memory message thread
+- One session = one conversation (from the user's perspective). Multiple tasks within a session are multiple turns of the same conversation
+- Always has a `workspaceId` — auto-assigned by the Session Service for every session regardless of type
+- Supports checkpointing and resume across desktop restarts (crash recovery only — the Local State Store is transient and cleared after a clean session end)
+- Ends when the user closes the session, the policy bundle expires, or the session is explicitly cancelled
+- Time-scoped: its lifecycle is about *who you are, what you are allowed to do, and where you are running* for this working period
+
+**executionEnvironment** is a session-level field that indicates where the agent is running:
+
+| Value | Meaning |
+|-------|---------|
+| `desktop` | Agent runs locally via Desktop App and Local Agent Host |
+| `cloud_sandbox` | Agent runs in a backend sandbox (future web extension) |
+
+This is distinct from `workspaceScope` on the workspace. `executionEnvironment` describes where the **agent** runs; `workspaceScope` describes where the **source files** live.
+
+**Terminology: session vs conversation**
+
+Internally the system uses the term **session** for this entity. In the Desktop App UI the user sees it labelled as a **conversation**. These are the same thing — different vocabulary for different audiences. The design doc uses "session" throughout; UI copy uses "conversation".
+
+### Task
+
+A task is a **single agent work cycle** triggered by one user prompt.
+
+- Created when the user sends a message (via the `StartTask` JSON-RPC call)
+- Has its own options: `maxSteps`, `allowNetwork`, `approvalMode`
+- Can be cancelled independently without ending the session — the user can cancel mid-task and send a new prompt without re-authenticating or re-fetching the policy bundle
+- One session can contain many tasks (multi-turn conversation)
+- Work-scoped: its lifecycle is about *what you asked for right now*
+- When a task completes, the full session message thread is snapshotted and uploaded to the Workspace Service as a `session_history` artifact — this applies to all sessions since every session has a workspace
+
+**Why session and task are kept separate:**
+
+| Concern | Session | Task |
+|---------|---------|------|
+| Policy and auth | ✓ | — |
+| LLM endpoint and token | ✓ | — |
+| executionEnvironment | ✓ | — |
+| Message thread ownership | ✓ | — |
+| Checkpointing and resume | ✓ | — |
+| Token budget tracking | ✓ (across all tasks) | — |
+| User prompt and intent | — | ✓ |
+| Step count limit | — | ✓ |
+| Cancellable independently | — | ✓ |
+
+**Why not session-per-task (one task = one session)?**
+
+This is a valid alternative model where each user message creates a new session. Its trade-offs for a desktop assistant are unfavourable:
+
+- Every user message triggers a full policy handshake — adds latency to every conversational turn
+- Token budgets reset per message — no session-level budget tracking across a conversation
+- Cancelling a task destroys the policy state — user must re-authenticate to continue
+- Multi-turn context is maintained only by passing history in each message payload, not by the session itself
+
+Session-per-task is appropriate for batch or API-driven agents (stateless, fire-and-forget). For a desktop chat-style assistant this design keeps sessions spanning multiple tasks.
+
+### Step
+
+A step is one **iteration of the agent loop** inside a task.
+
+- Consists of one LLM call followed by zero or more tool calls based on the model's response
+- Identified by a `stepId` scoped to its task
+- Tool calls, approvals, and artifacts generated within a step are all tagged with `sessionId`, `taskId`, and `stepId`
+
+### ID Relationships
+
+Every event, tool call, artifact, and audit record is tagged with the full chain of IDs:
+
+```
+workspaceId → sessionId → taskId → stepId
+```
+
+All four IDs are always present. Every session has a workspace, so `workspaceId` is never null.
+
+**Session resume — two distinct scenarios:**
+
+- **Crash recovery** (session did not end cleanly): the Local State Store checkpoint still exists. The Local Agent Host loads the checkpoint, reconstructs the in-memory message thread, and calls the Session Service to re-validate policy. Execution continues from the checkpoint cursor. This works identically for all session types.
+
+- **Continue a past conversation** (session ended cleanly, user wants to pick up): the Local State Store has been cleared. The user starts a new session. The Desktop App fetches the previous `session_history` artifact from the Workspace Service and bootstraps the new session's message thread from it. The user experiences continuity without interruption.
+
+---
+
 ## 3) Bounded Contexts
 
 ### 3.1 Agent Execution Context
@@ -209,8 +352,12 @@ WebSocket is optional later for server-initiated push use cases only.
 - LLM request construction
 - Tool routing decisions
 - Retry behavior
-- Checkpointing
+- Checkpointing (including full message thread)
 - Event generation
+- In-memory message thread management across all tasks in a session
+- Per-step checkpoint write to Local State Store (crash recovery only — transient)
+- Local State Store checkpoint deletion on clean session end
+- Session history snapshot upload to Workspace Service after each task completes (all sessions)
 
 **Does Not Own**
 
@@ -235,6 +382,8 @@ WebSocket is optional later for server-initiated push use cases only.
 - Tool output capture
 - Tool schema validation
 - Capability checks integration
+- MCP server lifecycle management (Phase 2+)
+- MCP tool discovery and registration (Phase 2+)
 
 **Does Not Own**
 
@@ -242,6 +391,18 @@ WebSocket is optional later for server-initiated push use cases only.
 - LLM invocation
 - Approval decisions
 - Policy authoring
+
+**Tool Architecture: Hybrid Built-in + MCP**
+
+The Local Tool Runtime uses a hybrid approach:
+
+- **Core tools are built-in** — file, shell, and git tools are implemented directly inside the Local Tool Runtime. They run in-process (or as tight subprocesses), have direct integration with the Local Policy Enforcer for capability checks, and are always available regardless of external dependencies.
+
+- **MCP is supported as an extension point (Phase 2+)** — the Local Tool Runtime also acts as an MCP host. It can discover, spawn, and manage external MCP servers, translate their tool manifests into the internal `ToolRequest`/`ToolResult` contract, and route calls to them. This allows enterprises and users to plug in custom or third-party tools without modifying the agent codebase.
+
+- **Policy enforcement wraps all tool calls uniformly** — whether a tool is built-in or MCP-backed, the capability check and approval gate happen at the routing layer inside the Local Tool Runtime before any execution occurs. MCP servers are never called directly by the agent loop.
+
+- **Skills are deferred** — formal skills (named, multi-step, stateful tool sequences) are not introduced in Phase 1 or 2. The LLM and system prompt handle task decomposition. Skills will be revisited once recurring tool sequences are well understood from usage patterns.
 
 ### 3.3 Policy and Guardrails Context
 
@@ -256,7 +417,7 @@ WebSocket is optional later for server-initiated push use cases only.
 **Responsibilities**
 
 - Policy bundle generation
-- Signed policy bundles
+- Policy bundles with expiry
 - Capability restrictions
 - Path restrictions
 - Command restrictions
@@ -310,6 +471,7 @@ WebSocket is optional later for server-initiated push use cases only.
 - Checkpoint references
 - Patch and diff artifact storage
 - Step output references
+- Session history artifact storage and retrieval (`session_history` artifact type)
 
 **Does Not Own**
 
@@ -381,6 +543,8 @@ All model traffic flows through **LLM Gateway** for:
 - audit
 - token accounting
 - model routing
+
+> **Implementation note:** The LLM Gateway is a **reused external service**, not built by this project. Integration is via a **configurable base URL and configurable auth token**. These values are injected at runtime — through the policy bundle for managed deployments, or through a local config file for development. The `backend-llm-gateway` repo is removed from scope.
 
 ### 4.3 Shared Runtime Contract
 
@@ -475,9 +639,11 @@ At session start, **Local Agent Host** performs a handshake with **Session Servi
 ### Handshake response
 
 - session id
+- workspace id (always present — auto-created or resolved by Session Service; scopes all artifact and history uploads for this session)
 - compatibility status
-- signed policy bundle
-- LLM Gateway endpoint
+- policy bundle
+- LLM Gateway endpoint (configurable — points to an existing external LLM Gateway)
+- LLM Gateway auth token (configurable — injected at session init, not hardcoded)
 - token and budget limits
 - approval rules
 - feature flags
@@ -520,7 +686,7 @@ sequenceDiagram
   DesktopApp->>LocalAgentHost: Launch runtime
   LocalAgentHost->>SessionService: Create session with capabilities
   SessionService->>PolicyService: Resolve policy bundle
-  PolicyService-->>SessionService: Signed policy bundle
+  PolicyService-->>SessionService: Policy bundle
   SessionService-->>LocalAgentHost: Session id and policy bundle
   LocalAgentHost-->>DesktopApp: Session ready
 ```
@@ -611,9 +777,109 @@ sequenceDiagram
 
 ---
 
+## 8a) Conversation Message Thread and Storage
+
+### Overview
+
+The original design did not define where conversation messages between the user and the AI are stored. This section defines the message storage architecture.
+
+### Design Decision: Backend-primary Storage with Local Transient Cache
+
+The conversation message thread follows a **backend-primary approach**:
+
+- **During an active session** — the Local Agent Host holds the full message thread in memory and checkpoints it to the **Local State Store** after each completed step. This is purely for crash recovery — the Local State Store is transient and is cleared after a clean session end.
+- **On each task completion** — the full session message thread so far is snapshotted and uploaded to the **Workspace Service** as a `session_history` artifact, overwriting the previous snapshot. This applies to all sessions — every session has a workspace.
+- **History is always fetched from the backend** — the Desktop App reads session history from the Workspace Service, never from the Local State Store. This keeps the desktop and web implementations identical.
+
+### Message Schema
+
+```json
+{
+  "$id": "ConversationMessage",
+  "type": "object",
+  "required": ["messageId", "sessionId", "role", "content", "timestamp"],
+  "properties": {
+    "messageId": { "type": "string" },
+    "sessionId": { "type": "string" },
+    "taskId":    { "type": "string" },
+    "stepId":    { "type": "string" },
+    "role": {
+      "type": "string",
+      "enum": ["system", "user", "assistant", "tool"]
+    },
+    "content":    { "type": "string" },
+    "tokenCount": { "type": "integer" },
+    "timestamp":  { "type": "string", "format": "date-time" }
+  },
+  "additionalProperties": false
+}
+```
+
+### Checkpoint Format
+
+The Local State Store checkpoint includes the full message thread alongside the state machine cursor:
+
+```json
+{
+  "sessionId": "sess_789",
+  "checkpointAt": "2026-02-21T15:09:00Z",
+  "stepCursor": "step_004",
+  "stateMachineState": "SESSION_RUNNING",
+  "messageThread": [
+    { "messageId": "msg_001", "role": "system",    "content": "...", "timestamp": "..." },
+    { "messageId": "msg_002", "role": "user",      "content": "...", "timestamp": "..." },
+    { "messageId": "msg_003", "role": "assistant", "content": "...", "timestamp": "..." }
+  ],
+  "pendingToolResult": null
+}
+```
+
+The checkpoint is written to the Local State Store after each step completes and is used exclusively for crash recovery. On a clean session end the checkpoint is deleted. On resume after a crash, the Local Agent Host loads the checkpoint and reconstructs the in-memory message thread from it — no backend call is needed for crash recovery.
+
+### Session History Artifact
+
+When a task completes, the Local Agent Host uploads a snapshot of the **full session message thread so far** to the Workspace Service as a `session_history` artifact. This snapshot overwrites the previous one for the same session — the Workspace Service always holds the latest complete thread.
+
+```json
+{
+  "artifactType": "session_history",
+  "workspaceId": "ws_456",
+  "sessionId": "sess_789",
+  "snapshotAfterTaskId": "task_003",
+  "snapshotAt": "2026-02-21T16:00:00Z",
+  "messages": [...]
+}
+```
+
+Uploading after each task (rather than at session end) means:
+- At most one task's worth of dialogue is unrecoverable if the session crashes
+- History is available for browsing in near-real-time, not only after the session ends
+- The Local State Store still covers within-task crash recovery (per-step checkpoint)
+
+This artifact is retrievable via the Workspace Service API and surfaced in the Desktop App as the conversation history for this session.
+
+### Storage Responsibility Summary
+
+| Scope | Storage | When written | Purpose |
+|-------|---------|-------------|---------|
+| Active session (in-flight) | Memory in Local Agent Host | Continuously | LLM request construction |
+| Per-step crash recovery | Local State Store (checkpoint) | After each step completes | Crash recovery only — transient, deleted on clean session end |
+| Per-task history | Workspace Service (`session_history` artifact) | After each task completes | All sessions — canonical history store, used for browsing and continuation |
+
+The Local State Store is never used for history browsing. It is a crash recovery buffer only.
+
+### Impact on Existing Components
+
+- **Local Agent Host** — manages the in-memory message thread; appends messages after each LLM turn and tool result; writes checkpoint to Local State Store after each step; uploads `session_history` snapshot to Workspace Service after each task; deletes Local State Store checkpoint on clean session end.
+- **Local State Store** — purely transient; holds the checkpoint for crash recovery within the current session only; cleared after a clean session end.
+- **Workspace Service** — canonical history store; holds one `session_history` artifact per session (overwritten after each task); serves history to both Desktop App and future web client.
+- **Session Service** — does not store messages; stores session metadata only; always returns a `workspaceId` in the handshake response (auto-creating one if needed).
+
+---
+
 ## 9) Capability Model
 
-Capabilities are issued by **Policy Service** in a signed policy bundle and enforced by **Local Policy Enforcer** and **Local Tool Runtime**.
+Capabilities are issued by **Policy Service** in a policy bundle and enforced by **Local Policy Enforcer** and **Local Tool Runtime**.
 
 ### Capability Table
 
@@ -648,9 +914,9 @@ Scope fields can include:
 
 ---
 
-## 10) Signed Policy Bundle
+## 10) Policy Bundle
 
-The **Policy Service** returns a signed policy bundle during session handshake.
+The **Policy Service** returns a policy bundle during session handshake. It is returned over the authenticated HTTPS session — no cryptographic signing is applied. Transit integrity is guaranteed by TLS.
 
 ### Example Policy Bundle
 
@@ -690,12 +956,7 @@ The **Policy Service** returns a signed policy bundle during session handshake.
       "title": "Local command execution",
       "description": "User approval required for shell commands"
     }
-  ],
-  "signature": {
-    "alg": "Ed25519",
-    "keyId": "policy-key-01",
-    "value": "base64-signature"
-  }
+  ]
 }
 ```
 
@@ -703,9 +964,8 @@ The **Policy Service** returns a signed policy bundle during session handshake.
 
 **Local Agent Host** must validate:
 
-- signature
-- expiry
-- session id match
+- expiry (`expiresAt` must be in the future)
+- session id match (bundle `sessionId` must match the active session)
 - schema version compatibility
 
 If validation fails, the session must not start.
@@ -738,6 +998,7 @@ Use **JSON-RPC 2.0** between **Desktop App** and **Local Agent Host** over stdio
   "params": {
     "userId": "user_123",
     "tenantId": "tenant_abc",
+    "executionEnvironment": "desktop",
     "workspaceHint": {
       "localPaths": [
         "/Users/suman/projects/demo"
@@ -1050,6 +1311,7 @@ Use one envelope shape across services.
   "timestamp": "2026-02-21T15:09:00Z",
   "tenantId": "tenant_abc",
   "userId": "user_123",
+  "workspaceId": "ws_456",
   "sessionId": "sess_789",
   "taskId": "task_001",
   "component": "LocalAgentHost",
@@ -1185,9 +1447,9 @@ Enforced by **LLM Gateway** and **Policy Service**
 
 ### Policy Distribution
 
-- policy bundle fetched at session start
-- policy bundle signed by Policy Service
-- Local Agent Host validates signature before use
+- policy bundle fetched at session start over authenticated HTTPS
+- bundle integrity guaranteed by TLS — no additional signing applied
+- Local Agent Host validates expiry and session id match before use
 
 ---
 
@@ -1293,6 +1555,31 @@ Mitigation:
 - start with REST and HTTP streaming
 - add WebSocket only for server push use cases
 
+### 19.6 MCP Server Trust and Security
+
+Risk:
+
+- each MCP server is a new trust boundary; a malicious or buggy server can exfiltrate data, execute arbitrary commands, or inject content into the agent context
+- MCP servers spawned from third-party packages widen the supply chain attack surface
+
+Mitigation:
+
+- capability checks and approval gates happen at the Local Tool Runtime routing layer before any MCP server is called — MCP servers are never invoked directly by the agent loop
+- MCP servers must be explicitly allowlisted in the policy bundle before the Local Tool Runtime will spawn or connect to them
+- MCP server processes run with restricted OS permissions (sandboxed where the platform supports it)
+- tool schemas from MCP servers are validated against expected contracts before being registered with the agent
+
+### 19.7 MCP Tool Schema Mismatch
+
+Risk:
+
+- MCP server tool schemas may not align with the internal `ToolRequest`/`ToolResult` contract, causing translation errors or silent data loss
+
+Mitigation:
+
+- the Local Tool Runtime owns a translation layer that maps MCP tool manifests and results to the internal contract
+- schema validation is applied at both ingress (MCP manifest registration) and egress (result mapping) so mismatches fail fast and loudly
+
 ---
 
 ## 20) Implementation Phasing for Desktop
@@ -1301,7 +1588,7 @@ Mitigation:
 
 - Desktop App
 - Local Agent Host
-- Local Tool Runtime
+- Local Tool Runtime with built-in file, shell, and git tools
 - Session Service
 - LLM Gateway
 - Policy Service
@@ -1314,8 +1601,10 @@ Mitigation:
 - Local Approval UI
 - Approval Service
 - Local State Store checkpoints and resume
-- signed policy bundles
 - compatibility handshake
+- MCP host support in Local Tool Runtime — discovery, spawning, and lifecycle management of external MCP servers
+- MCP server allowlist in policy bundle
+- translation layer between MCP tool manifests and internal ToolRequest/ToolResult contract
 
 ### Phase 3
 
@@ -1323,6 +1612,7 @@ Mitigation:
 - stronger guardrails
 - richer telemetry
 - policy revocation and optional server push
+- MCP server sandboxing and tighter trust controls
 
 ### Phase 4
 
@@ -1330,6 +1620,7 @@ Mitigation:
 - quotas and budgets
 - performance tuning
 - packaging and auto-update hardening for Windows and macOS
+- skills layer — formalize recurring tool sequences as named skills once usage patterns are well understood
 
 ---
 
@@ -1409,7 +1700,7 @@ sequenceDiagram
   User->>WebApp: Start session
   WebApp->>SessionService: Create session request
   SessionService->>PolicyService: Resolve policy bundle
-  PolicyService-->>SessionService: Signed policy bundle
+  PolicyService-->>SessionService: Policy bundle
   SessionService-->>WebApp: Session created
   SessionService->>SandboxAgentHost: Start sandbox session
   SandboxAgentHost->>LLMGateway: Stream LLM request
@@ -1499,7 +1790,7 @@ If you prefer fewer repos, the backend services can be grouped into one monorepo
 | `local-agent-host`          | AgentExecution             | Local Agent Host, Local State Store                     |
 | `local-tool-runtime`        | ToolExecution              | Local Tool Runtime, platform adapters                   |
 | `backend-session-service`   | SessionCoordination        | Session Service                                         |
-| `backend-llm-gateway`       | PolicyGuardrails           | LLM Gateway                                             |
+| `backend-llm-gateway`       | *(not implemented)*        | External service — endpoint and auth token are configurable; no repo needed |
 | `backend-policy-service`    | PolicyGuardrails           | Policy Service                                          |
 | `backend-approval-service`  | Approval                   | Approval Service                                        |
 | `backend-workspace-service` | WorkspaceArtifacts         | Workspace Service, storage adapters                     |
@@ -1578,22 +1869,27 @@ If you prefer fewer repos, the backend services can be grouped into one monorepo
 
 **Purpose**
 
-- Local tool execution engine with per-platform adapters
+- Local tool execution engine with per-platform adapters and MCP host support
 
 **Owns**
 
-- File tools
-- Shell command tools
-- Git tools
-- Network tool wrappers
+- Built-in file tools
+- Built-in shell command tools
+- Built-in git tools
+- Built-in network tool wrappers
 - Tool schema validation
 - OS-specific command and path handling
+- MCP server lifecycle management (spawn, supervise, restart)
+- MCP tool manifest discovery and registration
+- Translation layer between MCP tool schemas and internal ToolRequest/ToolResult contract
+- Unified routing layer — applies capability checks and approval gates before dispatching to either built-in tools or MCP servers
 
 **Does Not Own**
 
 - Agent loop orchestration
 - Approval persistence
 - LLM calls
+- Policy authoring
 
 **Suggested folders**
 
@@ -1601,6 +1897,9 @@ If you prefer fewer repos, the backend services can be grouped into one monorepo
 - `tools/shell`
 - `tools/git`
 - `tools/network`
+- `mcp/host` — MCP server lifecycle and connection management
+- `mcp/registry` — discovered tool manifest registry
+- `mcp/translator` — MCP schema ↔ ToolRequest/ToolResult mapping
 - `platform/macos`
 - `platform/windows`
 - `policy_hooks`
@@ -1650,14 +1949,14 @@ If you prefer fewer repos, the backend services can be grouped into one monorepo
 
 **Purpose**
 
-- Policy authoring, policy resolution, and signed policy bundles
+- Policy authoring, policy resolution, and policy bundle generation
 
 **Owns**
 
 - Policy bundle generation
 - Capability policy definitions
 - Approval rule definitions
-- Signature generation and key rotation integration
+- Policy bundle versioning and expiry management
 - LLM guardrail policy configuration
 
 **Does Not Own**
