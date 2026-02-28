@@ -104,7 +104,7 @@ SESSION_CREATED
 
 **What a session holds:**
 - Policy bundle (capabilities, approval rules, LLM policy) — received over authenticated HTTPS, validated by expiry and session id match
-- LLM Gateway endpoint and auth token
+- LLM Gateway config is NOT part of the session — endpoint and auth token are read from local environment variables (`LLM_GATEWAY_ENDPOINT`, `LLM_GATEWAY_AUTH_TOKEN`)
 - Token budget limits
 - Feature flags
 - In-memory message thread (owned by Local Agent Host during the session)

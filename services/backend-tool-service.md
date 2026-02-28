@@ -26,7 +26,7 @@ The Backend Tool Service provides remote-only tool execution for capabilities th
 
 ## What the Backend Tool Service Does NOT Do
 
-- It does not replace the Local Tool Runtime — file, shell, and git tools continue to run locally
+- It does not replace the Local Tool Runtime — file, shell, and network tools continue to run locally
 - It does not execute tools on behalf of the LLM directly — the Local Agent Host routes tool calls; the Backend Tool Service is one possible destination
 - It does not manage the agent loop — it is a stateless execution service called by the Local Agent Host
 

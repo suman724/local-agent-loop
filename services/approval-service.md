@@ -200,9 +200,9 @@ Used for audit review and compliance reporting.
 
 | Level | Examples |
 |-------|---------|
-| `low` | File.Read, Git.Status, Git.Diff |
-| `medium` | File.Write, Shell.Exec with known commands, Git.Commit |
-| `high` | File.Delete, Git.Push, Shell.Exec with unknown commands, Network.Http |
+| `low` | File.Read, Workspace.Upload |
+| `medium` | File.Write, Shell.Exec with known commands, Network.Http |
+| `high` | File.Delete, Shell.Exec with unknown commands |
 
 Risk level is set by the Local Policy Enforcer based on the capability and action, not by the user.
 

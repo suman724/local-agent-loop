@@ -18,7 +18,7 @@ This keeps the user experience local-first while preserving enterprise-grade gov
 |-----------|---------|
 | **Desktop App** | User interface — conversations, approval dialogs, patch preview |
 | **Local Agent Host** | Agent loop orchestration — planning, steps, LLM calls, tool routing, checkpointing |
-| **Local Tool Runtime** | Executes file, shell, git, and network tools; MCP host for external tools (Phase 2+) |
+| **Local Tool Runtime** | Executes file, shell, and network tools; MCP client for remote tool servers (Phase 2+) |
 | **Local Policy Enforcer** | Enforces capability and path restrictions from the policy bundle |
 | **Local Approval UI** | Presents approval requests to the user; captures decisions |
 | **Local State Store** | Transient crash-recovery buffer — holds checkpoint of active session only |
@@ -133,7 +133,7 @@ A workspace is a **backend namespace** for a session's history and artifacts. It
 
 A session is the **governance container** for one continuous working period — what the user sees as a "conversation" in the UI.
 
-- Holds: policy bundle, LLM Gateway endpoint and token, token budgets, approval rules, feature flags, `executionEnvironment`
+- Holds: policy bundle, token budgets, approval rules, feature flags, `executionEnvironment`
 - One session = one conversation; multiple tasks = multiple turns of the same conversation
 - Ends when the user closes it, the policy bundle expires, or it is explicitly cancelled
 
@@ -202,11 +202,11 @@ sequenceDiagram
   LocalAgentHost->>SessionService: POST /sessions (clientInfo, capabilities, workspaceHint)
   SessionService->>PolicyService: Resolve policy bundle
   PolicyService-->>SessionService: Policy bundle
-  SessionService-->>LocalAgentHost: sessionId, workspaceId, policyBundle, llmGateway config
+  SessionService-->>LocalAgentHost: sessionId, workspaceId, policyBundle, featureFlags
   LocalAgentHost-->>DesktopApp: Session ready
 ```
 
-The handshake returns everything the Local Agent Host needs: `sessionId`, `workspaceId`, the full policy bundle, and the LLM Gateway endpoint and token.
+The handshake returns everything the Local Agent Host needs: `sessionId`, `workspaceId`, the full policy bundle, and feature flags. LLM Gateway configuration (endpoint and auth token) is read from local environment variables (`LLM_GATEWAY_ENDPOINT`, `LLM_GATEWAY_AUTH_TOKEN`) — not sent by the Session Service.
 
 > Full API: [services/session-service.md](services/session-service.md)
 
@@ -279,10 +279,6 @@ Capabilities are issued in the policy bundle and enforced by **Local Policy Enfo
 | `File.Delete` | Delete files | `allowedPaths` | Usually yes |
 | `Shell.Exec` | Run local commands | `allowedCommands`, `blockedCommands` | Often yes |
 | `Network.Http` | Outbound HTTP requests | `allowedDomains` | Sometimes |
-| `Git.Status` | Read repo status | repo path | No |
-| `Git.Diff` | Read repo diff | repo path | No |
-| `Git.Commit` | Create commits | repo path | Usually yes |
-| `Git.Push` | Push commits | repo path, remote allowlist | Yes |
 | `Workspace.Upload` | Upload artifacts | workspace id, size limits | No |
 | `BackendTool.Invoke` | Invoke remote tools | tool name allowlist | Sometimes |
 | `LLM.Call` | Call LLM Gateway | model allowlist, token budgets | No |
@@ -291,8 +287,8 @@ Capabilities are issued in the policy bundle and enforced by **Local Policy Enfo
 
 ### Tool Architecture
 
-- **Phase 1 — built-in tools:** File, shell, and git tools run directly inside the Local Tool Runtime, always available.
-- **Phase 2+ — MCP extension:** Local Tool Runtime acts as an MCP host. It discovers, spawns, and manages external MCP servers, translating their tool manifests to the internal `ToolRequest`/`ToolResult` contract. MCP servers are never invoked directly by the agent loop — capability checks and approval gates always happen in the routing layer first.
+- **Phase 1 — built-in tools:** File, shell, and network tools run directly inside the Local Tool Runtime, always available.
+- **Phase 2+ — MCP extension:** Local Tool Runtime acts as an MCP client. It discovers and connects to remote MCP servers over streamable HTTP, translating their tool manifests to the internal `ToolRequest`/`ToolResult` contract. MCP servers are never invoked directly by the agent loop — capability checks and approval gates always happen in the routing layer first.
 - **Skills are deferred** to Phase 4, once recurring tool sequences are well understood from usage patterns.
 
 ---
@@ -315,7 +311,7 @@ Capabilities are issued in the policy bundle and enforced by **Local Policy Enfo
     "executionEnvironment": "desktop",
     "workspaceHint": { "localPaths": ["/Users/suman/projects/demo"] },
     "clientInfo": { "desktopAppVersion": "1.0.0", "localAgentHostVersion": "1.0.0", "osFamily": "macOS" },
-    "supportedCapabilities": ["File.Read", "File.Write", "Shell.Exec", "Git.Status", "Git.Commit", "LLM.Call"]
+    "supportedCapabilities": ["File.Read", "File.Write", "Shell.Exec", "Network.Http", "LLM.Call"]
   }
 }
 ```
@@ -348,7 +344,7 @@ Capabilities are issued in the policy bundle and enforced by **Local Policy Enfo
 
 ### 6.2 Tool Schemas — Local Agent Host ↔ Local Tool Runtime
 
-**Transport:** In-process function call (same process boundary in Phase 1; may become IPC in Phase 2+ with MCP)
+**Transport:** In-process function call (same process boundary)
 
 ```json
 // ToolRequest  —  Local Agent Host → Local Tool Runtime
@@ -405,7 +401,7 @@ All audit and telemetry events share one envelope. The `component` field identif
 }
 ```
 
-**Standard event names:** `session_created`, `session_started`, `step_started`, `llm_request_started`, `llm_request_completed`, `tool_requested`, `tool_completed`, `approval_requested`, `approval_resolved`, `session_completed`, `session_failed`
+**Standard event names:** `session_created`, `session_started`, `step_started`, `step_completed`, `step_limit_approaching`, `text_chunk`, `llm_request_started`, `llm_request_completed`, `tool_requested`, `tool_completed`, `approval_requested`, `approval_resolved`, `policy_expired`, `session_completed`, `session_failed`
 
 **Valid `component` values:** `DesktopApp`, `LocalAgentHost`, `LocalToolRuntime`, `LocalPolicyEnforcer`, `LocalApprovalUI`, `SessionService`, `LLMGateway`, `PolicyService`, `ApprovalService`, `WorkspaceService`, `AuditService`, `TelemetryService`, `BackendToolService`
 
@@ -442,13 +438,25 @@ Used consistently across local IPC responses and all backend HTTP error response
 }
 ```
 
-**Error codes:** `INVALID_REQUEST`, `UNAUTHORIZED`, `SESSION_NOT_FOUND`, `SESSION_EXPIRED`, `POLICY_BUNDLE_INVALID`, `POLICY_EXPIRED`, `CAPABILITY_DENIED`, `APPROVAL_REQUIRED`, `APPROVAL_DENIED`, `TOOL_NOT_FOUND`, `TOOL_EXECUTION_FAILED`, `LLM_GUARDRAIL_BLOCKED`, `LLM_BUDGET_EXCEEDED`, `WORKSPACE_UPLOAD_FAILED`, `RATE_LIMITED`, `INTERNAL_ERROR`
+**Error codes:** `INVALID_REQUEST`, `UNAUTHORIZED`, `SESSION_NOT_FOUND`, `SESSION_EXPIRED`, `POLICY_BUNDLE_INVALID`, `POLICY_EXPIRED`, `CAPABILITY_DENIED`, `APPROVAL_REQUIRED`, `APPROVAL_DENIED`, `TOOL_NOT_FOUND`, `TOOL_EXECUTION_FAILED`, `TOOL_EXECUTION_TIMEOUT`, `FILE_NOT_FOUND`, `FILE_TOO_LARGE`, `PERMISSION_DENIED`, `LLM_GUARDRAIL_BLOCKED`, `LLM_BUDGET_EXCEEDED`, `WORKSPACE_UPLOAD_FAILED`, `RATE_LIMITED`, `INTERNAL_ERROR`
 
 ---
 
-## 7. Service Design Docs
+## 7. Detailed Design Docs
 
-Detailed API contracts, data models, and implementation notes:
+### Desktop Components
+
+Internal design, algorithms, state machines, and module structure:
+
+| Component | Phase | Doc |
+|-----------|-------|-----|
+| Local Agent Host, Local Policy Enforcer, Local State Store | 1 (MVP) | [components/local-agent-host.md](components/local-agent-host.md) |
+| Desktop App, Local Approval UI | 1 (MVP) | [components/desktop-app.md](components/desktop-app.md) |
+| Local Tool Runtime | 1 (MVP) | [components/local-tool-runtime.md](components/local-tool-runtime.md) |
+
+### Backend Services
+
+API contracts, data models, and implementation notes:
 
 | Service | Phase | Doc |
 |---------|-------|-----|
@@ -525,15 +533,15 @@ All tables follow these conventions:
 
 ### Phase 1 — Core desktop agent
 
-Desktop App, Local Agent Host, Local Tool Runtime (built-in file/shell/git tools), Session Service, LLM Gateway integration, Policy Service, Workspace Service
+Desktop App, Local Agent Host, Local Tool Runtime (built-in file/shell/network tools), Session Service, LLM Gateway integration, Policy Service, Workspace Service
 
 ### Phase 2 — Approvals, MCP, and resilience
 
-Local Approval UI, Approval Service, Local State Store checkpoints and session resume, compatibility handshake, MCP host support in Local Tool Runtime (discovery, spawning, translation layer, policy bundle allowlist)
+Local Approval UI, Approval Service, Local State Store checkpoints and session resume, compatibility handshake, MCP client support in Local Tool Runtime (discovery, connection, translation layer, policy bundle allowlist)
 
 ### Phase 3 — Governance and extensibility
 
-Audit Service, Telemetry Service, Backend Tool Service (optional), stronger LLM guardrails, policy revocation, MCP server sandboxing, optional server push via WebSocket
+Audit Service, Telemetry Service, Backend Tool Service (optional), stronger LLM guardrails, policy revocation, optional server push via WebSocket
 
 ### Phase 4 — Scale and packaging
 
@@ -551,7 +559,7 @@ Separate agent-runtime download — Desktop App downloads and manages `agent-run
 | Version skew between local runtime and backend | Compatibility check in Session Service, policy schema versioning, feature flags |
 | Windows vs macOS tool behavior diverges | Per-platform adapters in Local Tool Runtime, strict tool schemas |
 | Malicious repo content injects into agent context | Provenance tagging, redaction rules in Local Policy Enforcer, LLM Gateway guardrails |
-| MCP server exfiltrates data or injects malicious tool output | Capability checks at routing layer (never invoke MCP directly), explicit allowlist in policy bundle, OS-level sandboxing, schema validation at manifest ingress and result egress |
+| Remote MCP server exfiltrates data or injects malicious tool output | Capability checks at routing layer (never invoke MCP directly), explicit allowlist in policy bundle, TLS-only connections, endpoint authentication, schema validation at manifest ingress and result egress |
 | MCP tool schema mismatch causes silent data loss | Translation layer in Local Tool Runtime validates at both ingress and egress — mismatches fail loudly |
 
 ---
@@ -626,7 +634,7 @@ desktop/
 
 agent-runtime/
   agent-host/     ← Local Agent Host (agent loop, session client, LLM client, JSON-RPC server)
-  tool-runtime/   ← Local Tool Runtime (built-in tools, MCP host, platform adapters)
+  tool-runtime/   ← Local Tool Runtime (built-in tools, MCP client, platform adapters)
   build/          ← Platform-specific packaging (macOS arm64/x86_64, Windows x64)
 
 backend-observability/

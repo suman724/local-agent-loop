@@ -1,7 +1,7 @@
 # Policy Service — Detailed Design
 
 **Phase:** 1 (MVP)
-**Repo:** `backend-session` (`policy/` package)
+**Repo:** `backend-policy`
 **Bounded Context:** PolicyGuardrails
 
 ---
@@ -102,10 +102,6 @@ Capabilities define what the agent is permitted to do. Each capability has a nam
 | `File.Delete` | Delete files | Allowed path prefixes | Usually yes | Local Policy Enforcer, Local Tool Runtime |
 | `Shell.Exec` | Run local commands | Command allowlist, cwd paths | Often yes | Local Policy Enforcer, Local Tool Runtime |
 | `Network.Http` | Outbound HTTP requests | Domain allowlist | Sometimes | Local Policy Enforcer, Local Tool Runtime |
-| `Git.Status` | Read repo status | Repo path | Usually no | Local Policy Enforcer, Local Tool Runtime |
-| `Git.Diff` | Read repo diff | Repo path | Usually no | Local Policy Enforcer, Local Tool Runtime |
-| `Git.Commit` | Create commits | Repo path, branch policy | Usually yes | Local Policy Enforcer, Local Tool Runtime |
-| `Git.Push` | Push commits | Repo path, remote allowlist | Yes | Local Policy Enforcer, Local Tool Runtime |
 | `Workspace.Upload` | Upload artifacts | Workspace id, size limits | Usually no | Local Agent Host |
 | `BackendTool.Invoke` | Invoke remote-only tools | Tool names | Sometimes | Local Agent Host, Policy Service |
 | `LLM.Call` | Call LLM Gateway | Model allowlist, token budgets | No | LLM Gateway, Policy Service |

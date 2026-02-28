@@ -1,7 +1,7 @@
 # Session Service — Detailed Design
 
 **Phase:** 1 (MVP)
-**Repo:** `backend-session` (`session/` package)
+**Repo:** `backend-session`
 **Bounded Context:** SessionCoordination
 
 ---
@@ -62,9 +62,7 @@ Called by the Local Agent Host at startup to establish a new session.
     "File.Read",
     "File.Write",
     "Shell.Exec",
-    "Git.Status",
-    "Git.Diff",
-    "Git.Commit",
+    "Network.Http",
     "Workspace.Upload",
     "LLM.Call"
   ]
@@ -78,16 +76,14 @@ Called by the Local Agent Host at startup to establish a new session.
   "workspaceId": "ws_456",
   "compatibilityStatus": "compatible",
   "policyBundle": { ... },
-  "llmGateway": {
-    "endpoint": "https://llm-gateway.example.com",
-    "authToken": "tok_abc"
-  },
   "featureFlags": {
     "approvalUiEnabled": true,
     "mcpEnabled": false
   }
 }
 ```
+
+> **LLM Gateway configuration** (endpoint and auth token) is not included in the response. The agent-runtime reads both from local environment variables (`LLM_GATEWAY_ENDPOINT`, `LLM_GATEWAY_AUTH_TOKEN`). This avoids sending credentials in API responses. LLM Gateway configuration will be revisited in a later phase.
 
 **Workspace resolution logic:**
 - If `workspaceHint.localPaths` is provided → resolve or create a `local`-scoped workspace matching that path
@@ -113,11 +109,7 @@ Called by the Local Agent Host after a desktop restart when a checkpoint exists 
   "sessionId": "sess_789",
   "workspaceId": "ws_456",
   "compatibilityStatus": "compatible",
-  "policyBundle": { ... },
-  "llmGateway": {
-    "endpoint": "https://llm-gateway.example.com",
-    "authToken": "tok_abc"
-  }
+  "policyBundle": { ... }
 }
 ```
 
@@ -168,7 +160,7 @@ sequenceDiagram
   WorkspaceService-->>SessionService: workspaceId
   SessionService->>PolicyService: GET policy bundle (tenantId, userId, capabilities)
   PolicyService-->>SessionService: Policy bundle
-  SessionService-->>LocalAgentHost: sessionId, workspaceId, policyBundle, llmGateway config
+  SessionService-->>LocalAgentHost: sessionId, workspaceId, policyBundle, featureFlags
 ```
 
 ---
@@ -199,7 +191,7 @@ sequenceDiagram
 | `tenantId` | string | Tenant |
 | `userId` | string | User |
 | `executionEnvironment` | enum | `desktop` or `cloud_sandbox` |
-| `status` | enum | `SESSION_CREATED`, `SESSION_RUNNING`, `SESSION_COMPLETED`, `SESSION_FAILED`, `SESSION_CANCELLED` |
+| `status` | enum | `SESSION_CREATED`, `SESSION_RUNNING`, `SESSION_PAUSED`, `SESSION_COMPLETED`, `SESSION_FAILED`, `SESSION_CANCELLED` |
 | `createdAt` | datetime | Session creation time |
 | `expiresAt` | datetime | Policy bundle expiry — session must not continue past this |
 

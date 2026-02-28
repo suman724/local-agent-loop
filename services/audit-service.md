@@ -46,7 +46,7 @@ At minimum, the Audit Service must retain:
 | Policy bundle generated | What permissions were granted and when |
 | Approval requested | What the agent asked to do |
 | Approval resolved | What the user decided |
-| High-risk tool invocations | Shell.Exec, File.Delete, Git.Push, Network.Http |
+| High-risk tool invocations | Shell.Exec, File.Delete, Network.Http |
 | LLM request and response metadata | Token usage, model used (not content) |
 | Session state transitions | When sessions moved to failed or cancelled |
 
