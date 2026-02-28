@@ -1,7 +1,7 @@
 # Session Service — Detailed Design
 
 **Phase:** 1 (MVP)
-**Repo:** `backend-session-service`
+**Repo:** `backend-session` (`session/` package)
 **Bounded Context:** SessionCoordination
 
 ---
@@ -67,14 +67,6 @@ Called by the Local Agent Host at startup to establish a new session.
     "Git.Commit",
     "Workspace.Upload",
     "LLM.Call"
-  ],
-  "supportedTools": [
-    "ReadFile",
-    "WriteFile",
-    "RunCommand",
-    "GitStatus",
-    "GitDiff",
-    "GitCommit"
   ]
 }
 ```
@@ -210,6 +202,39 @@ sequenceDiagram
 | `status` | enum | `SESSION_CREATED`, `SESSION_RUNNING`, `SESSION_COMPLETED`, `SESSION_FAILED`, `SESSION_CANCELLED` |
 | `createdAt` | datetime | Session creation time |
 | `expiresAt` | datetime | Policy bundle expiry — session must not continue past this |
+
+---
+
+## Data Store
+
+**Database:** DynamoDB table `{env}-sessions`
+
+### Key schema
+
+| Key | Value |
+|-----|-------|
+| Partition key | `sessionId` (String) |
+| TTL attribute | `ttl` (Number, Unix epoch) — set from `expiresAt`; DynamoDB auto-deletes expired sessions |
+
+### Global Secondary Indexes
+
+| GSI | Partition key | Sort key | Use |
+|-----|--------------|----------|-----|
+| `tenantId-userId-index` | `tenantId` | `createdAt` | List sessions for a user within a tenant, sorted by creation time |
+
+### Stored attributes
+
+`sessionId`, `tenantId`, `userId`, `workspaceId`, `executionEnvironment`, `status`, `createdAt`, `expiresAt`, `ttl`, `clientInfo`
+
+### Testing
+
+| Tier | Infrastructure |
+|------|---------------|
+| Unit tests | `InMemorySessionRepository` — no infrastructure needed |
+| Service tests | DynamoDB Local: `docker run -p 8000:8000 amazon/dynamodb-local` |
+| Integration tests | LocalStack: `docker run -p 4566:4566 localstack/localstack` |
+
+Set `AWS_ENDPOINT_URL=http://localhost:8000` (DynamoDB Local) or `http://localhost:4566` (LocalStack) to point the service at a local emulator. The same repository code runs in all environments.
 
 ---
 

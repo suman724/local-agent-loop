@@ -1,7 +1,7 @@
 # Workspace Service — Detailed Design
 
 **Phase:** 1 (MVP)
-**Repo:** `backend-workspace-service`
+**Repo:** `backend-workspace`
 **Bounded Context:** WorkspaceArtifacts
 
 ---
@@ -202,11 +202,68 @@ Created (by Session Service at session start)
 
 ## Storage Architecture
 
-The Workspace Service abstracts over two underlying stores:
+The Workspace Service uses two stores:
 
-| Store | Holds | Notes |
-|-------|-------|-------|
-| **Artifact Store** | Raw artifact content (binary, text, JSON payloads) | Blob storage (e.g. S3, Azure Blob) |
-| **Metadata Store** | Artifact metadata, workspace manifests, session lists | Relational or document database |
+| Store | Technology | Holds |
+|-------|-----------|-------|
+| **Metadata Store** | DynamoDB | Workspace records, artifact metadata, session lists |
+| **Artifact Store** | S3 | Raw artifact content (binary, text, JSON payloads) |
 
-The Workspace Service API layer never exposes the underlying store implementation — clients always go through the service.
+The API layer never exposes the underlying store — clients always go through the service.
+
+### DynamoDB — `{env}-workspaces` table
+
+Stores workspace records.
+
+| Key | Value |
+|-----|-------|
+| Partition key | `workspaceId` (String) |
+
+| GSI | Partition key | Sort key | Use |
+|-----|--------------|----------|-----|
+| `tenantId-userId-index` | `tenantId` | `userId` | List workspaces for a user |
+| `localpath-lookup-index` | `localPathKey`* | — | Idempotent resolve of `local`-scoped workspaces |
+
+*`localPathKey` is a composite attribute: `{tenantId}#{userId}#{localPath}` — populated only for `local`-scoped workspaces.
+
+Stored attributes: `workspaceId`, `tenantId`, `userId`, `workspaceScope`, `localPath`, `localPathKey`, `createdAt`, `lastActiveAt`
+
+### DynamoDB — `{env}-artifacts` table
+
+Stores artifact metadata. Artifact content lives in S3; this table holds the pointer.
+
+| Key | Value |
+|-----|-------|
+| Partition key | `workspaceId` (String) |
+| Sort key | `artifactId` (String) |
+
+| GSI | Partition key | Sort key | Use |
+|-----|--------------|----------|-----|
+| `sessionId-type-index` | `sessionId` | `artifactType#createdAt` | Retrieve `session_history` for a session; list tool outputs |
+
+Stored attributes: `workspaceId`, `artifactId`, `sessionId`, `taskId`, `artifactType`, `artifactName`, `contentType`, `s3Key`, `createdAt`
+
+### S3 — `{env}-workspace-artifacts` bucket
+
+Stores raw artifact content. Each object is addressed by:
+
+```
+s3://{env}-workspace-artifacts/{workspaceId}/{artifactId}
+```
+
+The `s3Key` attribute in the DynamoDB artifact record is the full S3 object key.
+
+### Testing
+
+| Tier | Infrastructure |
+|------|---------------|
+| Unit tests | `InMemoryWorkspaceRepository` — no infrastructure needed |
+| Service tests | DynamoDB Local + LocalStack S3: both accessible via LocalStack on port 4566 |
+| Integration tests | LocalStack: `docker run -p 4566:4566 localstack/localstack` — emulates both DynamoDB and S3 together |
+
+The Workspace Service is the primary reason LocalStack is preferred over DynamoDB Local for integration tests — it needs both S3 and DynamoDB running simultaneously.
+
+```bash
+# LocalStack covers both stores
+AWS_ENDPOINT_URL=http://localhost:4566
+```

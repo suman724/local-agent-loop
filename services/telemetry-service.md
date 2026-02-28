@@ -4,7 +4,7 @@
 > The Telemetry Service is planned but not required for Phase 1 or 2. A basic implementation may be added in Phase 3 alongside stronger observability features. References in other service docs to `POST /telemetry/events` and `POST /telemetry/traces` should be treated as no-ops or logged locally until this service exists.
 
 **Phase:** 3
-**Repo:** `backend-telemetry-service`
+**Repo:** `backend-observability` (`telemetry/` package)
 **Bounded Context:** ObservabilityAudit
 
 ---
@@ -184,6 +184,28 @@ A `traceId` spans the full step lifecycle:
 ```
 
 **Response:** `202 Accepted`
+
+---
+
+## Data Store
+
+The Telemetry Service does **not** use DynamoDB. Telemetry data (traces, metrics, operational events) has characteristics that purpose-built observability infrastructure handles better:
+
+- High write throughput at low latency
+- Time-series aggregation and rollup
+- Trace correlation across spans
+- Short retention with automatic expiry
+
+**Production:** Route events to an OpenTelemetry-compatible backend — CloudWatch, Jaeger, Grafana Tempo, Datadog, or equivalent. The specific backend is an infrastructure decision, not a product decision.
+
+**Local testing:** Run a local OpenTelemetry collector or use LocalStack's CloudWatch emulation. For Phase 1 and 2, telemetry events can simply be logged to stdout — the caller interface is stable even if the backend is a no-op.
+
+```bash
+# LocalStack CloudWatch (if using CloudWatch as the backend)
+docker run -p 4566:4566 localstack/localstack
+```
+
+No repository pattern or DynamoDB table is needed for the Telemetry Service.
 
 ---
 

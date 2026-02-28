@@ -1,7 +1,7 @@
 # Policy Service — Detailed Design
 
 **Phase:** 1 (MVP)
-**Repo:** `backend-policy-service`
+**Repo:** `backend-session` (`policy/` package)
 **Bounded Context:** PolicyGuardrails
 
 ---
@@ -147,6 +147,41 @@ The `llmPolicy` block controls what the agent is allowed to send to and receive 
 - `schemaVersion` — the schema version of the bundle format, used by the client for compatibility checks
 - `expiresAt` — bundles are short-lived; the client must not use an expired bundle. On expiry, the session must end or re-authenticate.
 - Policy bundles are not refreshed mid-session in Phase 1. Policy revocation mid-session is a Phase 3 feature.
+
+---
+
+## Data Store
+
+### Phase 1 — configuration files
+
+In Phase 1 there is no per-tenant policy authoring. Policy rules are defined as static configuration (JSON or YAML files) loaded at service startup. The Policy Service reads these files and assembles bundles on demand — no database is required.
+
+This keeps Phase 1 simple: no table to manage, no migration, and policies can be changed by deploying updated config.
+
+### Phase 3 — DynamoDB for per-tenant policy
+
+When per-tenant policy authoring is introduced in Phase 3, policies move into DynamoDB.
+
+**Table:** `{env}-policies`
+
+| Key | Value |
+|-----|-------|
+| Partition key | `tenantId` (String) |
+| Sort key | `policyVersion` (String) — e.g. `2026-02-21.1` |
+
+| GSI | Partition key | Sort key | Use |
+|-----|--------------|----------|-----|
+| `tenantId-active-index` | `tenantId` | `isActive` | Fetch the current active policy for a tenant |
+
+Stored attributes: `tenantId`, `policyVersion`, `isActive`, `capabilities`, `llmPolicy`, `approvalRules`, `schemaVersion`, `createdAt`, `createdBy`
+
+### Testing (Phase 3 only)
+
+| Tier | Infrastructure |
+|------|---------------|
+| Unit tests | `InMemoryPolicyRepository` — no infrastructure needed |
+| Service tests | DynamoDB Local: `docker run -p 8000:8000 amazon/dynamodb-local` |
+| Integration tests | LocalStack: `docker run -p 4566:4566 localstack/localstack` |
 
 ---
 

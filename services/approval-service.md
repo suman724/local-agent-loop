@@ -1,7 +1,7 @@
 # Approval Service — Detailed Design
 
 **Phase:** 2
-**Repo:** `backend-approval-service`
+**Repo:** `backend-approval`
 **Bounded Context:** Approval
 
 ---
@@ -205,6 +205,38 @@ Used for audit review and compliance reporting.
 | `high` | File.Delete, Git.Push, Shell.Exec with unknown commands, Network.Http |
 
 Risk level is set by the Local Policy Enforcer based on the capability and action, not by the user.
+
+---
+
+## Data Store
+
+**Database:** DynamoDB table `{env}-approvals`
+
+### Key schema
+
+| Key | Value |
+|-----|-------|
+| Partition key | `approvalId` (String) |
+
+### Global Secondary Indexes
+
+| GSI | Partition key | Sort key | Use |
+|-----|--------------|----------|-----|
+| `sessionId-index` | `sessionId` | `clientTimestamp` | List all approval decisions for a session, sorted by time |
+
+### Stored attributes
+
+`approvalId`, `sessionId`, `taskId`, `stepId`, `userId`, `tenantId`, `workspaceId`, `decision`, `reason`, `actionSummary`, `riskLevel`, `clientTimestamp`, `serverTimestamp`, `createdAt`
+
+Approval records are never updated or deleted — the store is effectively append-only per `approvalId`.
+
+### Testing
+
+| Tier | Infrastructure |
+|------|---------------|
+| Unit tests | `InMemoryApprovalRepository` — no infrastructure needed |
+| Service tests | DynamoDB Local: `docker run -p 8000:8000 amazon/dynamodb-local` |
+| Integration tests | LocalStack: `docker run -p 4566:4566 localstack/localstack` |
 
 ---
 

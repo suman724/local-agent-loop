@@ -4,7 +4,7 @@
 > The Audit Service is planned but not required for Phase 1 or 2. It should be designed and built in Phase 3 alongside stronger governance features. References in other service docs to `POST /audit/events` should be treated as no-ops or logged locally until this service exists.
 
 **Phase:** 3
-**Repo:** `backend-audit-service`
+**Repo:** `backend-observability` (`audit/` package)
 **Bounded Context:** ObservabilityAudit
 
 ---
@@ -121,6 +121,43 @@ All events use a standard envelope:
 ```
 
 **Response:** `202 Accepted`
+
+---
+
+## Data Store
+
+**Database:** DynamoDB table `{env}-audit-events`
+
+Audit events are **append-only** — items are never updated or deleted before their TTL expires.
+
+### Key schema
+
+| Key | Value |
+|-----|-------|
+| Partition key | `sessionId` (String) |
+| Sort key | `timestamp#eventId` (String) — e.g. `2026-02-21T15:09:00Z#evt_123` |
+| TTL attribute | `ttl` (Number, Unix epoch) — set per tenant retention policy (default: 1 year) |
+
+Using `sessionId` as the partition key makes per-session audit queries efficient. The sort key's time prefix enables time-range queries within a session.
+
+### Global Secondary Indexes
+
+| GSI | Partition key | Sort key | Use |
+|-----|--------------|----------|-----|
+| `tenantId-index` | `tenantId` | `timestamp#eventId` | Compliance reporting across all sessions for a tenant, with time-range filtering |
+| `eventId-index` | `eventId` | — | Direct lookup of a single event by ID |
+
+### Stored attributes
+
+All fields from the event envelope: `eventId`, `eventType`, `timestamp`, `tenantId`, `userId`, `workspaceId`, `sessionId`, `taskId`, `component`, `boundedContext`, `severity`, `payload`, `ttl`, `createdAt`
+
+### Testing
+
+| Tier | Infrastructure |
+|------|---------------|
+| Unit tests | `InMemoryAuditRepository` — no infrastructure needed |
+| Service tests | DynamoDB Local: `docker run -p 8000:8000 amazon/dynamodb-local` |
+| Integration tests | LocalStack: `docker run -p 4566:4566 localstack/localstack` |
 
 ---
 

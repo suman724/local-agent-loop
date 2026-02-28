@@ -4,7 +4,7 @@
 > The Backend Tool Service is optional and planned for Phase 3. It is not required for Phase 1 or Phase 2. All tool execution in Phase 1 and Phase 2 happens locally via the Local Tool Runtime.
 
 **Phase:** 3 (optional)
-**Repo:** `backend-tool-service`
+**Repo:** `backend-tools`
 **Bounded Context:** ToolExecution
 
 ---
@@ -193,6 +193,16 @@ Remote tool results use the same `ToolResult` schema as local tools:
 ```
 
 Using the same `ToolResult` schema as the Local Tool Runtime means the Local Agent Host processes results from both local and remote tools identically.
+
+---
+
+## Data Store
+
+The Backend Tool Service is **stateless** — it does not own a database. All session context is passed per-request by the Local Agent Host.
+
+Tool configurations (e.g. database connection strings, API keys for remote tools) are tenant-scoped and injected at runtime via environment variables or a secrets manager (e.g. AWS Secrets Manager). They are never stored in a service-owned database.
+
+Large tool outputs are written directly to the Workspace Service's S3 bucket — the Backend Tool Service holds no artifact state of its own.
 
 ---
 
