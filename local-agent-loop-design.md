@@ -31,7 +31,7 @@ The system is split into two major parts:
    - **Policy Service** generates policy bundles and approval rules
    - **LLM Gateway** enforces LLM guardrails and routes model requests
    - **Approval Service** persists approval decisions
-   - **Workspace Service** stores artifacts and checkpoints using **Artifact Store** and **Metadata Store**
+   - **Workspace Service** stores artifacts and session history using **Artifact Store** and **Metadata Store**
    - **Audit Service** and **Telemetry Service** provide centralized traceability and operations visibility
 
 ### Why this design exists
@@ -112,14 +112,15 @@ That is why the design standardizes:
 A good reading order is:
 
 1. **Deployment model and component names**
-2. **Bounded contexts**
-3. **Architecture and sequence diagrams**
-4. **Capability model and policy bundle**
-5. **Protocol contracts and schemas**
-6. **Repo mapping for implementation planning**
-7. **Web extension section**
+2. **Domain model** — workspace, session, task, step hierarchy
+3. **Bounded contexts**
+4. **Architecture and sequence diagrams**
+5. **Capability model and policy bundle**
+6. **Protocol contracts and schemas**
+7. **Repo mapping for implementation planning**
+8. **Service design docs** — detailed API and data model for each service
 
-This order helps you understand the intent and boundaries first, then the protocols and implementation details.
+---
 
 ## Scope
 
@@ -196,6 +197,8 @@ WebSocket is optional later for server-initiated push use cases only.
 ## 2a) Domain Model: Workspace, Session, Task, Step
 
 This section defines the core domain entities and their relationships. Understanding this hierarchy is essential before reading the component and sequence sections.
+
+> See also: [domain-model.md](domain-model.md) — the standalone authoritative reference for all domain concepts.
 
 ### The Hierarchy
 
@@ -297,17 +300,6 @@ A task is a **single agent work cycle** triggered by one user prompt.
 | Step count limit | — | ✓ |
 | Cancellable independently | — | ✓ |
 
-**Why not session-per-task (one task = one session)?**
-
-This is a valid alternative model where each user message creates a new session. Its trade-offs for a desktop assistant are unfavourable:
-
-- Every user message triggers a full policy handshake — adds latency to every conversational turn
-- Token budgets reset per message — no session-level budget tracking across a conversation
-- Cancelling a task destroys the policy state — user must re-authenticate to continue
-- Multi-turn context is maintained only by passing history in each message payload, not by the session itself
-
-Session-per-task is appropriate for batch or API-driven agents (stateless, fire-and-forget). For a desktop chat-style assistant this design keeps sessions spanning multiple tasks.
-
 ### Step
 
 A step is one **iteration of the agent loop** inside a task.
@@ -328,9 +320,9 @@ All four IDs are always present. Every session has a workspace, so `workspaceId`
 
 **Session resume — two distinct scenarios:**
 
-- **Crash recovery** (session did not end cleanly): the Local State Store checkpoint still exists. The Local Agent Host loads the checkpoint, reconstructs the in-memory message thread, and calls the Session Service to re-validate policy. Execution continues from the checkpoint cursor. This works identically for all session types.
+- **Crash recovery** (session did not end cleanly): the Local State Store checkpoint still exists. The Local Agent Host loads the checkpoint, reconstructs the in-memory message thread, and calls the Session Service to re-validate policy. Execution continues from the checkpoint cursor.
 
-- **Continue a past conversation** (session ended cleanly, user wants to pick up): the Local State Store has been cleared. The user starts a new session. The Desktop App fetches the previous `session_history` artifact from the Workspace Service and bootstraps the new session's message thread from it. The user experiences continuity without interruption.
+- **Continue a past conversation** (session ended cleanly, user wants to pick up): the Local State Store has been cleared. The user starts a new session. The Desktop App fetches the previous `session_history` artifact from the Workspace Service and bootstraps the new session's message thread from it.
 
 ---
 
@@ -446,7 +438,6 @@ The Local Tool Runtime uses a hybrid approach:
 - Capability handshake
 - Session metadata
 - Session status transitions
-- Event replay cursors (optional)
 
 **Does Not Own**
 
@@ -456,7 +447,7 @@ The Local Tool Runtime uses a hybrid approach:
 
 ### 3.5 Workspace and Artifacts Context
 
-**Purpose:** Persist and serve artifacts and checkpoints.
+**Purpose:** Persist and serve artifacts and session history.
 
 **Owned Components**
 
@@ -468,10 +459,8 @@ The Local Tool Runtime uses a hybrid approach:
 
 - Workspace manifests
 - Artifact upload and retrieval
-- Checkpoint references
-- Patch and diff artifact storage
-- Step output references
 - Session history artifact storage and retrieval (`session_history` artifact type)
+- Step output references
 
 **Does Not Own**
 
@@ -634,12 +623,12 @@ At session start, **Local Agent Host** performs a handshake with **Session Servi
 - Local Agent Host version
 - supported tool list
 - supported capabilities
-- cached policy bundle version (optional)
+- workspace hint (local project path, if any)
 
 ### Handshake response
 
 - session id
-- workspace id (always present — auto-created or resolved by Session Service; scopes all artifact and history uploads for this session)
+- workspace id (always present — auto-created or resolved by Session Service)
 - compatibility status
 - policy bundle
 - LLM Gateway endpoint (configurable — points to an existing external LLM Gateway)
@@ -649,6 +638,8 @@ At session start, **Local Agent Host** performs a handshake with **Session Servi
 - feature flags
 
 This ensures the local loop receives centrally governed policy before work starts.
+
+> See [services/session-service.md](services/session-service.md) for the full Session Service API, request/response schemas, and session resume flow.
 
 ---
 
@@ -781,15 +772,21 @@ sequenceDiagram
 
 ### Overview
 
-The original design did not define where conversation messages between the user and the AI are stored. This section defines the message storage architecture.
-
-### Design Decision: Backend-primary Storage with Local Transient Cache
-
 The conversation message thread follows a **backend-primary approach**:
 
 - **During an active session** — the Local Agent Host holds the full message thread in memory and checkpoints it to the **Local State Store** after each completed step. This is purely for crash recovery — the Local State Store is transient and is cleared after a clean session end.
-- **On each task completion** — the full session message thread so far is snapshotted and uploaded to the **Workspace Service** as a `session_history` artifact, overwriting the previous snapshot. This applies to all sessions — every session has a workspace.
-- **History is always fetched from the backend** — the Desktop App reads session history from the Workspace Service, never from the Local State Store. This keeps the desktop and web implementations identical.
+- **On each task completion** — the full session message thread so far is snapshotted and uploaded to the **Workspace Service** as a `session_history` artifact, overwriting the previous snapshot. This applies to all sessions.
+- **History is always fetched from the backend** — the Desktop App reads session history from the Workspace Service, never from the Local State Store.
+
+### Storage Responsibility Summary
+
+| Scope | Storage | When written | Purpose |
+|-------|---------|-------------|---------|
+| Active session (in-flight) | Memory in Local Agent Host | Continuously | LLM request construction |
+| Per-step crash recovery | Local State Store (checkpoint) | After each step completes | Crash recovery only — transient, deleted on clean session end |
+| Per-task history | Workspace Service (`session_history` artifact) | After each task completes | Canonical history store, used for browsing and continuation |
+
+The Local State Store is never used for history browsing. It is a crash recovery buffer only.
 
 ### Message Schema
 
@@ -815,66 +812,6 @@ The conversation message thread follows a **backend-primary approach**:
 }
 ```
 
-### Checkpoint Format
-
-The Local State Store checkpoint includes the full message thread alongside the state machine cursor:
-
-```json
-{
-  "sessionId": "sess_789",
-  "checkpointAt": "2026-02-21T15:09:00Z",
-  "stepCursor": "step_004",
-  "stateMachineState": "SESSION_RUNNING",
-  "messageThread": [
-    { "messageId": "msg_001", "role": "system",    "content": "...", "timestamp": "..." },
-    { "messageId": "msg_002", "role": "user",      "content": "...", "timestamp": "..." },
-    { "messageId": "msg_003", "role": "assistant", "content": "...", "timestamp": "..." }
-  ],
-  "pendingToolResult": null
-}
-```
-
-The checkpoint is written to the Local State Store after each step completes and is used exclusively for crash recovery. On a clean session end the checkpoint is deleted. On resume after a crash, the Local Agent Host loads the checkpoint and reconstructs the in-memory message thread from it — no backend call is needed for crash recovery.
-
-### Session History Artifact
-
-When a task completes, the Local Agent Host uploads a snapshot of the **full session message thread so far** to the Workspace Service as a `session_history` artifact. This snapshot overwrites the previous one for the same session — the Workspace Service always holds the latest complete thread.
-
-```json
-{
-  "artifactType": "session_history",
-  "workspaceId": "ws_456",
-  "sessionId": "sess_789",
-  "snapshotAfterTaskId": "task_003",
-  "snapshotAt": "2026-02-21T16:00:00Z",
-  "messages": [...]
-}
-```
-
-Uploading after each task (rather than at session end) means:
-- At most one task's worth of dialogue is unrecoverable if the session crashes
-- History is available for browsing in near-real-time, not only after the session ends
-- The Local State Store still covers within-task crash recovery (per-step checkpoint)
-
-This artifact is retrievable via the Workspace Service API and surfaced in the Desktop App as the conversation history for this session.
-
-### Storage Responsibility Summary
-
-| Scope | Storage | When written | Purpose |
-|-------|---------|-------------|---------|
-| Active session (in-flight) | Memory in Local Agent Host | Continuously | LLM request construction |
-| Per-step crash recovery | Local State Store (checkpoint) | After each step completes | Crash recovery only — transient, deleted on clean session end |
-| Per-task history | Workspace Service (`session_history` artifact) | After each task completes | All sessions — canonical history store, used for browsing and continuation |
-
-The Local State Store is never used for history browsing. It is a crash recovery buffer only.
-
-### Impact on Existing Components
-
-- **Local Agent Host** — manages the in-memory message thread; appends messages after each LLM turn and tool result; writes checkpoint to Local State Store after each step; uploads `session_history` snapshot to Workspace Service after each task; deletes Local State Store checkpoint on clean session end.
-- **Local State Store** — purely transient; holds the checkpoint for crash recovery within the current session only; cleared after a clean session end.
-- **Workspace Service** — canonical history store; holds one `session_history` artifact per session (overwritten after each task); serves history to both Desktop App and future web client.
-- **Session Service** — does not store messages; stores session metadata only; always returns a `workspaceId` in the handshake response (auto-creating one if needed).
-
 ---
 
 ## 9) Capability Model
@@ -898,19 +835,18 @@ Capabilities are issued by **Policy Service** in a policy bundle and enforced by
 | `BackendTool.Invoke` | Invoke remote-only tools | Tool names                        | Sometimes         | Local Agent Host, Policy Service          |
 | `LLM.Call`           | Call LLM Gateway         | Model allowlist and token budgets | No                | LLM Gateway, Policy Service               |
 
-### Scope Examples
+### Scope Fields
 
-Scope fields can include:
+Capability entries can include any of these scope constraints:
 
-- `allowedPaths`
-- `blockedPaths`
-- `allowedCommands`
-- `blockedCommands`
-- `allowedDomains`
-- `maxFileSizeBytes`
-- `maxOutputBytes`
-- `requiresApproval`
-- `approvalRuleId`
+- `allowedPaths` / `blockedPaths` — for file capabilities
+- `allowedCommands` / `blockedCommands` — for Shell.Exec
+- `allowedDomains` — for Network.Http
+- `maxFileSizeBytes` / `maxOutputBytes` — size limits
+- `requiresApproval` — boolean flag
+- `approvalRuleId` — reference to an approval rule in the bundle
+
+> See [services/policy-service.md](services/policy-service.md) for the full policy bundle structure, LLM policy fields, and capability scope reference.
 
 ---
 
@@ -918,57 +854,25 @@ Scope fields can include:
 
 The **Policy Service** returns a policy bundle during session handshake. It is returned over the authenticated HTTPS session — no cryptographic signing is applied. Transit integrity is guaranteed by TLS.
 
-### Example Policy Bundle
+The bundle contains:
+- `policyBundleVersion` and `schemaVersion` — versioning for compatibility checks
+- `tenantId`, `userId`, `sessionId` — scoping identifiers
+- `expiresAt` — bundles are short-lived; the client must not use an expired bundle
+- `capabilities` — list of capability grants with scope constraints
+- `llmPolicy` — allowed models, token limits
+- `approvalRules` — approval rule definitions referenced by capabilities
 
-```json
-{
-  "policyBundleVersion": "2026-02-21.1",
-  "schemaVersion": "1.0",
-  "tenantId": "tenant_abc",
-  "userId": "user_123",
-  "sessionId": "sess_789",
-  "expiresAt": "2026-02-21T18:30:00Z",
-  "capabilities": [
-    {
-      "name": "File.Read",
-      "allowedPaths": [
-        "/Users/suman/projects/demo",
-        "C:\\Users\\Suman\\projects\\demo"
-      ],
-      "requiresApproval": false
-    },
-    {
-      "name": "Shell.Exec",
-      "allowedCommands": ["git", "python", "npm", "pytest"],
-      "requiresApproval": true,
-      "approvalRuleId": "approval_shell_exec"
-    }
-  ],
-  "llmPolicy": {
-    "allowedModels": ["gpt-5.2-coder", "gpt-5.2-mini"],
-    "maxInputTokens": 64000,
-    "maxOutputTokens": 4000,
-    "maxSessionTokens": 250000
-  },
-  "approvalRules": [
-    {
-      "approvalRuleId": "approval_shell_exec",
-      "title": "Local command execution",
-      "description": "User approval required for shell commands"
-    }
-  ]
-}
-```
+### Client-side Validation
 
-### Validation Rules
+**Local Agent Host** must validate before starting the session:
 
-**Local Agent Host** must validate:
-
-- expiry (`expiresAt` must be in the future)
-- session id match (bundle `sessionId` must match the active session)
-- schema version compatibility
+- `expiresAt` is in the future
+- `sessionId` in the bundle matches the active session
+- `schemaVersion` is supported by this version of the Local Agent Host
 
 If validation fails, the session must not start.
+
+> See [services/policy-service.md](services/policy-service.md) for the full policy bundle JSON example and all field definitions.
 
 ---
 
@@ -1000,9 +904,7 @@ Use **JSON-RPC 2.0** between **Desktop App** and **Local Agent Host** over stdio
     "tenantId": "tenant_abc",
     "executionEnvironment": "desktop",
     "workspaceHint": {
-      "localPaths": [
-        "/Users/suman/projects/demo"
-      ]
+      "localPaths": ["/Users/suman/projects/demo"]
     },
     "clientInfo": {
       "desktopAppVersion": "1.0.0",
@@ -1010,24 +912,8 @@ Use **JSON-RPC 2.0** between **Desktop App** and **Local Agent Host** over stdio
       "osFamily": "macOS",
       "osVersion": "14.6"
     },
-    "supportedCapabilities": [
-      "File.Read",
-      "File.Write",
-      "Shell.Exec",
-      "Git.Status",
-      "Git.Diff",
-      "Git.Commit",
-      "Workspace.Upload",
-      "LLM.Call"
-    ],
-    "supportedTools": [
-      "ReadFile",
-      "WriteFile",
-      "RunCommand",
-      "GitStatus",
-      "GitDiff",
-      "GitCommit"
-    ]
+    "supportedCapabilities": ["File.Read", "File.Write", "Shell.Exec", "Git.Status", "Git.Diff", "Git.Commit", "Workspace.Upload", "LLM.Call"],
+    "supportedTools": ["ReadFile", "WriteFile", "RunCommand", "GitStatus", "GitDiff", "GitCommit"]
   }
 }
 ```
@@ -1075,119 +961,9 @@ Use **JSON-RPC 2.0** between **Desktop App** and **Local Agent Host** over stdio
 
 ---
 
-## 12) Backend API Payload Examples
+## 12) JSON Schemas for Key Messages
 
-### 12.1 Session Service Create Session
-
-`POST /sessions`
-
-```json
-{
-  "tenantId": "tenant_abc",
-  "userId": "user_123",
-  "clientInfo": {
-    "desktopAppVersion": "1.0.0",
-    "localAgentHostVersion": "1.0.0",
-    "osFamily": "macOS",
-    "osVersion": "14.6"
-  },
-  "supportedCapabilities": [
-    "File.Read",
-    "File.Write",
-    "Shell.Exec",
-    "Git.Status",
-    "Git.Diff",
-    "Git.Commit",
-    "Workspace.Upload",
-    "LLM.Call"
-  ],
-  "supportedTools": [
-    "ReadFile",
-    "WriteFile",
-    "RunCommand",
-    "GitStatus",
-    "GitDiff",
-    "GitCommit"
-  ],
-  "workspaceHint": {
-    "localPaths": ["/Users/suman/projects/demo"]
-  }
-}
-```
-
-### 12.2 LLM Gateway Stream Request
-
-`POST /llm/stream`
-
-```json
-{
-  "sessionId": "sess_789",
-  "taskId": "task_001",
-  "stepId": "step_004",
-  "model": "gpt-5.2-coder",
-  "messages": [
-    {
-      "role": "system",
-      "content": "You are a coding assistant."
-    },
-    {
-      "role": "user",
-      "content": "Refactor the HTTP client and add tests."
-    }
-  ],
-  "contextMetadata": {
-    "sourceProvenance": [
-      {
-        "sourceType": "local_file",
-        "path": "/Users/suman/projects/demo/client.py",
-        "trustLevel": "local_project"
-      }
-    ],
-    "redactionApplied": true
-  },
-  "stream": true
-}
-```
-
-### 12.3 Approval Service Persist Decision
-
-`POST /approvals/{approvalId}/decision`
-
-```json
-{
-  "sessionId": "sess_789",
-  "taskId": "task_001",
-  "decision": "approved",
-  "userId": "user_123",
-  "reason": "Command is expected for test run",
-  "clientTimestamp": "2026-02-21T15:08:10Z"
-}
-```
-
-### 12.4 Workspace Service Upload Artifact
-
-`POST /workspaces/{workspaceId}/artifacts`
-
-```json
-{
-  "sessionId": "sess_789",
-  "taskId": "task_001",
-  "artifactType": "tool_output",
-  "artifactName": "pytest_output.txt",
-  "contentType": "text/plain",
-  "contentBase64": "cHl0ZXN0IG91dHB1dA==",
-  "metadata": {
-    "toolName": "RunCommand",
-    "stepId": "step_006"
-  }
-}
-```
-
----
-
-## 13) JSON Schemas for Key Messages
-
-### 13.1 Session Event Schema
+### 12.1 Session Event Schema
 
 ```json
 {
@@ -1195,33 +971,27 @@ Use **JSON-RPC 2.0** between **Desktop App** and **Local Agent Host** over stdio
   "type": "object",
   "required": ["eventId", "sessionId", "eventType", "timestamp", "payload"],
   "properties": {
-    "eventId": { "type": "string" },
+    "eventId":   { "type": "string" },
     "sessionId": { "type": "string" },
-    "taskId": { "type": "string" },
+    "taskId":    { "type": "string" },
     "eventType": {
       "type": "string",
       "enum": [
-        "session_created",
-        "session_started",
-        "step_started",
-        "llm_request_started",
-        "llm_request_completed",
-        "tool_requested",
-        "tool_completed",
-        "approval_requested",
-        "approval_resolved",
-        "session_completed",
-        "session_failed"
+        "session_created", "session_started", "step_started",
+        "llm_request_started", "llm_request_completed",
+        "tool_requested", "tool_completed",
+        "approval_requested", "approval_resolved",
+        "session_completed", "session_failed"
       ]
     },
     "timestamp": { "type": "string", "format": "date-time" },
-    "payload": { "type": "object" }
+    "payload":   { "type": "object" }
   },
   "additionalProperties": false
 }
 ```
 
-### 13.2 Tool Request Schema
+### 12.2 Tool Request Schema
 
 ```json
 {
@@ -1229,18 +999,18 @@ Use **JSON-RPC 2.0** between **Desktop App** and **Local Agent Host** over stdio
   "type": "object",
   "required": ["toolName", "arguments", "sessionId", "taskId", "stepId"],
   "properties": {
-    "toolName": { "type": "string" },
-    "arguments": { "type": "object" },
-    "sessionId": { "type": "string" },
-    "taskId": { "type": "string" },
-    "stepId": { "type": "string" },
+    "toolName":   { "type": "string" },
+    "arguments":  { "type": "object" },
+    "sessionId":  { "type": "string" },
+    "taskId":     { "type": "string" },
+    "stepId":     { "type": "string" },
     "capability": { "type": "string" }
   },
   "additionalProperties": false
 }
 ```
 
-### 13.3 Tool Result Schema
+### 12.3 Tool Result Schema
 
 ```json
 {
@@ -1248,23 +1018,20 @@ Use **JSON-RPC 2.0** between **Desktop App** and **Local Agent Host** over stdio
   "type": "object",
   "required": ["toolName", "sessionId", "taskId", "stepId", "status"],
   "properties": {
-    "toolName": { "type": "string" },
+    "toolName":  { "type": "string" },
     "sessionId": { "type": "string" },
-    "taskId": { "type": "string" },
-    "stepId": { "type": "string" },
+    "taskId":    { "type": "string" },
+    "stepId":    { "type": "string" },
     "status": {
       "type": "string",
       "enum": ["succeeded", "failed", "denied"]
     },
-    "outputText": { "type": "string" },
-    "artifactUris": {
-      "type": "array",
-      "items": { "type": "string" }
-    },
+    "outputText":   { "type": "string" },
+    "artifactUris": { "type": "array", "items": { "type": "string" } },
     "error": {
       "type": "object",
       "properties": {
-        "code": { "type": "string" },
+        "code":    { "type": "string" },
         "message": { "type": "string" }
       },
       "required": ["code", "message"],
@@ -1275,32 +1042,9 @@ Use **JSON-RPC 2.0** between **Desktop App** and **Local Agent Host** over stdio
 }
 ```
 
-### 13.4 Approval Request Schema
-
-```json
-{
-  "$id": "ApprovalRequest",
-  "type": "object",
-  "required": ["approvalId", "sessionId", "taskId", "title", "actionSummary"],
-  "properties": {
-    "approvalId": { "type": "string" },
-    "sessionId": { "type": "string" },
-    "taskId": { "type": "string" },
-    "title": { "type": "string" },
-    "actionSummary": { "type": "string" },
-    "riskLevel": {
-      "type": "string",
-      "enum": ["low", "medium", "high"]
-    },
-    "details": { "type": "object" }
-  },
-  "additionalProperties": false
-}
-```
-
 ---
 
-## 14) Event Envelope Standard for Telemetry and Audit
+## 13) Event Envelope Standard for Telemetry and Audit
 
 Use one envelope shape across services.
 
@@ -1323,33 +1067,15 @@ Use one envelope shape across services.
 
 ### Allowed component values
 
-- `DesktopApp`
-- `LocalAgentHost`
-- `LocalToolRuntime`
-- `LocalPolicyEnforcer`
-- `LocalApprovalUI`
-- `SessionService`
-- `LLMGateway`
-- `PolicyService`
-- `ApprovalService`
-- `WorkspaceService`
-- `AuditService`
-- `TelemetryService`
-- `BackendToolService`
+`DesktopApp`, `LocalAgentHost`, `LocalToolRuntime`, `LocalPolicyEnforcer`, `LocalApprovalUI`, `SessionService`, `LLMGateway`, `PolicyService`, `ApprovalService`, `WorkspaceService`, `AuditService`, `TelemetryService`, `BackendToolService`
 
 ### Allowed boundedContext values
 
-- `AgentExecution`
-- `ToolExecution`
-- `PolicyGuardrails`
-- `SessionCoordination`
-- `WorkspaceArtifacts`
-- `Approval`
-- `ObservabilityAudit`
+`AgentExecution`, `ToolExecution`, `PolicyGuardrails`, `SessionCoordination`, `WorkspaceArtifacts`, `Approval`, `ObservabilityAudit`
 
 ---
 
-## 15) Error Model
+## 14) Error Model
 
 Define a consistent error shape across local IPC and backend APIs.
 
@@ -1388,40 +1114,23 @@ Define a consistent error shape across local IPC and backend APIs.
 
 ---
 
-## 16) Interfaces and APIs Summary
+## 15) Service Design Docs
 
-### Local IPC
+Detailed API contracts, data models, and implementation notes for each service are in individual service design docs:
 
-JSON-RPC 2.0 over stdio or local socket
-
-### Remote APIs
-
-- **Session Service**
-  - `POST /sessions`
-  - `POST /sessions/{sessionId}/resume`
-  - `POST /sessions/{sessionId}/cancel`
-  - `GET /sessions/{sessionId}`
-- **LLM Gateway**
-  - `POST /llm/stream`
-  - `POST /llm/embed` (optional)
-  - `POST /llm/moderate` (optional)
-- **Approval Service**
-  - `POST /approvals`
-  - `POST /approvals/{approvalId}/decision`
-  - `GET /approvals/{approvalId}`
-- **Workspace Service**
-  - `POST /workspaces`
-  - `POST /workspaces/{workspaceId}/artifacts`
-  - `POST /workspaces/{workspaceId}/checkpoints`
-  - `GET /workspaces/{workspaceId}/artifacts/{artifactId}`
-- **Audit and Telemetry**
-  - `POST /audit/events`
-  - `POST /telemetry/events`
-  - `POST /telemetry/traces`
+| Service | Phase | Doc |
+|---------|-------|-----|
+| Session Service | 1 (MVP) | [services/session-service.md](services/session-service.md) |
+| Policy Service | 1 (MVP) | [services/policy-service.md](services/policy-service.md) |
+| Workspace Service | 1 (MVP) | [services/workspace-service.md](services/workspace-service.md) |
+| Approval Service | 2 | [services/approval-service.md](services/approval-service.md) |
+| Audit Service | 3 (future) | [services/audit-service.md](services/audit-service.md) |
+| Telemetry Service | 3 (future) | [services/telemetry-service.md](services/telemetry-service.md) |
+| Backend Tool Service | 3 (optional) | [services/backend-tool-service.md](services/backend-tool-service.md) |
 
 ---
 
-## 17) Security Model
+## 16) Security Model
 
 ### Local Controls
 
@@ -1453,7 +1162,7 @@ Enforced by **LLM Gateway** and **Policy Service**
 
 ---
 
-## 18) Observability and Audit
+## 17) Observability and Audit
 
 ### Standard Event Names
 
@@ -1491,11 +1200,13 @@ At minimum:
 - policy decisions
 - session state transitions
 
+> See [services/audit-service.md](services/audit-service.md) and [services/telemetry-service.md](services/telemetry-service.md) for detailed event schemas and API contracts.
+
 ---
 
-## 19) Gaps and Risk Areas
+## 18) Gaps and Risk Areas
 
-### 19.1 Local Loop Durability
+### 18.1 Local Loop Durability
 
 Risk:
 
@@ -1507,7 +1218,7 @@ Mitigation:
 - idempotent tool contracts
 - session resume support
 
-### 19.2 Version Skew
+### 18.2 Version Skew
 
 Risk:
 
@@ -1519,7 +1230,7 @@ Mitigation:
 - policy schema versioning
 - feature flags
 
-### 19.3 Cross Platform Differences
+### 18.3 Cross Platform Differences
 
 Risk:
 
@@ -1531,7 +1242,7 @@ Mitigation:
 - strict tool schemas
 - capability discovery during handshake
 
-### 19.4 Prompt Injection From Local Content
+### 18.4 Prompt Injection From Local Content
 
 Risk:
 
@@ -1544,7 +1255,7 @@ Mitigation:
 - LLM Gateway guardrails
 - approval for risky actions
 
-### 19.5 Overusing WebSocket Too Early
+### 18.5 Overusing WebSocket Too Early
 
 Risk:
 
@@ -1555,7 +1266,7 @@ Mitigation:
 - start with REST and HTTP streaming
 - add WebSocket only for server push use cases
 
-### 19.6 MCP Server Trust and Security
+### 18.6 MCP Server Trust and Security
 
 Risk:
 
@@ -1569,7 +1280,7 @@ Mitigation:
 - MCP server processes run with restricted OS permissions (sandboxed where the platform supports it)
 - tool schemas from MCP servers are validated against expected contracts before being registered with the agent
 
-### 19.7 MCP Tool Schema Mismatch
+### 18.7 MCP Tool Schema Mismatch
 
 Risk:
 
@@ -1582,7 +1293,7 @@ Mitigation:
 
 ---
 
-## 20) Implementation Phasing for Desktop
+## 19) Implementation Phasing for Desktop
 
 ### Phase 1
 
@@ -1590,11 +1301,9 @@ Mitigation:
 - Local Agent Host
 - Local Tool Runtime with built-in file, shell, and git tools
 - Session Service
-- LLM Gateway
+- LLM Gateway (external — integration only)
 - Policy Service
 - Workspace Service
-- basic Audit Service
-- basic Telemetry Service
 
 ### Phase 2
 
@@ -1608,7 +1317,9 @@ Mitigation:
 
 ### Phase 3
 
-- remote-only tool support via Backend Tool Service
+- Audit Service
+- Telemetry Service
+- remote-only tool support via Backend Tool Service (optional)
 - stronger guardrails
 - richer telemetry
 - policy revocation and optional server push
@@ -1624,7 +1335,7 @@ Mitigation:
 
 ---
 
-## 21) Web Extension Section
+## 20) Web Extension Section
 
 This section is intentionally separate from the desktop-first design.
 
@@ -1685,31 +1396,6 @@ flowchart LR
   SandboxToolRuntime -. "optional remote-only tools" .-> BackendToolService
 ```
 
-### Web Mode Sequence Diagram
-
-```mermaid
-sequenceDiagram
-  participant User
-  participant WebApp as Web App
-  participant SessionService as Session Service
-  participant PolicyService as Policy Service
-  participant SandboxAgentHost as Sandbox Agent Host
-  participant LLMGateway as LLM Gateway
-  participant WorkspaceService as Workspace Service
-
-  User->>WebApp: Start session
-  WebApp->>SessionService: Create session request
-  SessionService->>PolicyService: Resolve policy bundle
-  PolicyService-->>SessionService: Policy bundle
-  SessionService-->>WebApp: Session created
-  SessionService->>SandboxAgentHost: Start sandbox session
-  SandboxAgentHost->>LLMGateway: Stream LLM request
-  LLMGateway-->>SandboxAgentHost: Stream guarded response
-  SandboxAgentHost->>WorkspaceService: Upload artifacts
-  WorkspaceService-->>SandboxAgentHost: Artifact URIs
-  SandboxAgentHost-->>WebApp: Session events
-```
-
 ### Why the same design still works
 
 Desktop and web share:
@@ -1724,7 +1410,7 @@ Only the runtime location changes.
 
 ---
 
-## 22) Optional Future WebSocket Addendum
+## 21) Optional Future WebSocket Addendum
 
 WebSocket is optional and not needed for v1 desktop.
 
@@ -1739,7 +1425,7 @@ Reuse the same `SessionEvent` schema for WebSocket messages.
 
 ---
 
-## 23) Protocol Package Guidance for Implementation
+## 22) Protocol Package Guidance for Implementation
 
 To keep generated code and hand-written code aligned, maintain a shared `protocol` package with:
 
@@ -1756,11 +1442,11 @@ This prevents drift across Desktop App, Local Agent Host, Local Tool Runtime, an
 
 ---
 
-## 24) Component to Repo Mapping
+## 23) Component to Repo Mapping
 
 This section maps bounded contexts and components to repositories so coding agents can work in clear boundaries with minimal cross-repo ambiguity.
 
-### 24.1 Repo Layout Overview
+### 23.1 Repo Layout Overview
 
 Recommended repositories:
 
@@ -1768,7 +1454,6 @@ Recommended repositories:
 - `local-agent-host`
 - `local-tool-runtime`
 - `backend-session-service`
-- `backend-llm-gateway`
 - `backend-policy-service`
 - `backend-approval-service`
 - `backend-workspace-service`
@@ -1782,7 +1467,9 @@ Recommended repositories:
 
 If you prefer fewer repos, the backend services can be grouped into one monorepo while keeping the same folder boundaries.
 
-### 24.2 Repo to Bounded Context Mapping
+Note: `backend-llm-gateway` is not listed — the LLM Gateway is an external service; no repo needs to be built.
+
+### 23.2 Repo to Bounded Context Mapping
 
 | Repo                        | Primary Bounded Context    | Owned Components                                        |
 | --------------------------- | -------------------------- | ------------------------------------------------------- |
@@ -1790,7 +1477,6 @@ If you prefer fewer repos, the backend services can be grouped into one monorepo
 | `local-agent-host`          | AgentExecution             | Local Agent Host, Local State Store                     |
 | `local-tool-runtime`        | ToolExecution              | Local Tool Runtime, platform adapters                   |
 | `backend-session-service`   | SessionCoordination        | Session Service                                         |
-| `backend-llm-gateway`       | *(not implemented)*        | External service — endpoint and auth token are configurable; no repo needed |
 | `backend-policy-service`    | PolicyGuardrails           | Policy Service                                          |
 | `backend-approval-service`  | Approval                   | Approval Service                                        |
 | `backend-workspace-service` | WorkspaceArtifacts         | Workspace Service, storage adapters                     |
@@ -1802,336 +1488,58 @@ If you prefer fewer repos, the backend services can be grouped into one monorepo
 | `infra-platform`            | Deployment and operations  | IaC, CI CD, secrets wiring, runtime infra               |
 | `docs-architecture`         | Architecture documentation | Design docs, ADRs, diagrams, runbooks                   |
 
-### 24.3 Detailed Repo Responsibilities
+### 23.3 Desktop Repo Responsibilities
 
 #### `desktop-app`
 
-**Purpose**
-
-- User-facing desktop application shell for macOS and Windows
-
-**Owns**
-
-- Desktop UI screens
-- Session launch and stop UI
-- Approval dialogs and patch preview UI
+- Desktop UI screens, session launch and stop UI, approval dialogs, patch preview UI
 - JSON-RPC client to Local Agent Host
 - Local process lifecycle management for Local Agent Host
 
-**Does Not Own**
-
-- Agent loop logic
-- Tool execution implementation
-- Policy evaluation logic
-
-**Suggested folders**
-
-- `src/ui`
-- `src/ipc`
-- `src/session`
-- `src/approvals`
-- `src/patch-preview`
-- `src/platform`
-
 #### `local-agent-host`
 
-**Purpose**
-
-- Local runtime process that hosts the agent loop
-
-**Owns**
-
-- Agent loop state machine
-- Planning and step orchestration
+- Agent loop state machine and planning
 - Session checkpointing in Local State Store
 - Calls to Session Service, LLM Gateway, Approval Service, Workspace Service
 - Event generation and local JSON-RPC server
-
-**Does Not Own**
-
-- Desktop UI rendering
-- Tool execution internals
-- Central policy authoring
-
-**Suggested folders**
-
-- `agent_loop`
-- `ipc_server`
-- `session_client`
-- `llm_gateway_client`
-- `workspace_client`
-- `approval_client`
-- `policy_bundle`
-- `state_store`
-- `events`
+- Uploads `session_history` to Workspace Service after each task
 
 #### `local-tool-runtime`
 
-**Purpose**
-
-- Local tool execution engine with per-platform adapters and MCP host support
-
-**Owns**
-
-- Built-in file tools
-- Built-in shell command tools
-- Built-in git tools
-- Built-in network tool wrappers
-- Tool schema validation
-- OS-specific command and path handling
-- MCP server lifecycle management (spawn, supervise, restart)
-- MCP tool manifest discovery and registration
-- Translation layer between MCP tool schemas and internal ToolRequest/ToolResult contract
-- Unified routing layer — applies capability checks and approval gates before dispatching to either built-in tools or MCP servers
-
-**Does Not Own**
-
-- Agent loop orchestration
-- Approval persistence
-- LLM calls
-- Policy authoring
-
-**Suggested folders**
-
-- `tools/file`
-- `tools/shell`
-- `tools/git`
-- `tools/network`
-- `mcp/host` — MCP server lifecycle and connection management
-- `mcp/registry` — discovered tool manifest registry
-- `mcp/translator` — MCP schema ↔ ToolRequest/ToolResult mapping
-- `platform/macos`
-- `platform/windows`
-- `policy_hooks`
-- `tool_schemas`
-
-#### `backend-session-service`
-
-**Purpose**
-
-- Session creation, resume, compatibility checks, and metadata
-
-**Owns**
-
-- Session APIs
-- Capability handshake processing
-- Version compatibility policy
-- Session metadata persistence
-- Session status transitions
-
-**Does Not Own**
-
-- LLM request processing
-- Tool execution
-- Artifact storage internals
-
-#### `backend-llm-gateway`
-
-**Purpose**
-
-- Centralized model access and guardrail enforcement point
-
-**Owns**
-
-- LLM streaming endpoints
-- Request and response guardrail invocation
-- Model routing
-- Token and budget checks
-- LLM request audit metadata emission
-
-**Does Not Own**
-
-- Session creation
-- Tool execution
-- Policy authoring rules source
-
-#### `backend-policy-service`
-
-**Purpose**
-
-- Policy authoring, policy resolution, and policy bundle generation
-
-**Owns**
-
-- Policy bundle generation
-- Capability policy definitions
-- Approval rule definitions
-- Policy bundle versioning and expiry management
-- LLM guardrail policy configuration
-
-**Does Not Own**
-
-- LLM provider connectivity
-- Tool execution
-- Workspace storage
-
-#### `backend-approval-service`
-
-**Purpose**
-
-- Approval decision persistence and retrieval
-
-**Owns**
-
-- Approval record APIs
-- Approval lifecycle state
-- Audit hooks for decisions
-
-**Does Not Own**
-
-- Approval UI rendering
-- Tool execution
-- Agent loop state machine
-
-#### `backend-workspace-service`
-
-**Purpose**
-
-- Artifact and checkpoint metadata plus storage access APIs
-
-**Owns**
-
-- Workspace manifests
-- Artifact upload and retrieval APIs
-- Checkpoint references
-- Metadata store and artifact store adapters
-
-**Does Not Own**
-
-- Agent planning
-- Policy decisions
-- Audit decisions
-
-#### `backend-audit-service`
-
-**Purpose**
-
-- Immutable or append-only audit events for security and compliance
-
-**Owns**
-
-- Audit event ingest APIs
-- Audit storage model
-- Query interfaces for audit review
-
-**Does Not Own**
-
-- Tracing and metrics aggregation
-- Agent execution logic
-
-#### `backend-telemetry-service`
-
-**Purpose**
-
-- Telemetry ingest and trace processing
-
-**Owns**
-
-- Telemetry event APIs
-- Trace ingestion
-- Metrics aggregation pipeline integration
-
-**Does Not Own**
-
-- Security audit retention policies
-- Business workflow orchestration
-
-#### `backend-tool-service` (optional)
-
-**Purpose**
-
-- Remote-only tools for capabilities not available or not allowed locally
-
-**Owns**
-
-- Tool workers and APIs for remote tools
-- Workspace output integration
-- Telemetry and audit hooks for remote tools
-
-**Does Not Own**
-
-- Local tool execution
-- Session handshake
-- LLM governance
-
-#### `protocol-contracts`
-
-**Purpose**
-
-- Single source of truth for protocol definitions and schemas
-
-**Owns**
-
-- JSON schemas
-- JSON-RPC method contracts
-- Event names and envelope spec
-- Error code catalog
-- Capability names and field definitions
-
-**Does Not Own**
-
-- Runtime business logic
-- UI code
-- Service deployment code
-
-#### `shared-sdk` (optional but recommended)
-
-**Purpose**
-
-- Reusable client libraries generated or hand-written from `protocol-contracts`
-
-**Owns**
-
-- Session Service client
-- LLM Gateway client
-- Approval Service client
-- Workspace Service client
-- Event envelope helpers
-- Error parsing and retry helpers
-
-**Does Not Own**
-
-- Service implementations
-- Policy rules
-
-#### `infra-platform`
-
-**Purpose**
-
-- Infrastructure, deployment, and operations automation
-
-**Owns**
-
-- Terraform or equivalent IaC
-- CI CD templates
-- secrets and key management integration
-- environment configs
-- observability infrastructure wiring
-
-**Does Not Own**
-
-- Product business logic
-- protocol definitions
-
-#### `docs-architecture`
-
-**Purpose**
-
-- Architecture source of truth and ADRs
-
-**Owns**
-
-- This design doc
-- ADRs
-- runbooks
-- threat models
-- operational playbooks
-
-### 24.4 Dependency Rules Between Repos
-
-Use these rules to prevent tight coupling.
+- Built-in file, shell, git, and network tools
+- MCP server lifecycle management, tool discovery, and translation layer (Phase 2+)
+- Unified routing layer — capability checks and approval gates before dispatching to built-in tools or MCP servers
+- OS-specific adapters for macOS and Windows
+
+### 23.4 Backend Repo Responsibilities
+
+Each backend service repo has a detailed design doc in [services/](services/):
+
+| Repo | Detail doc |
+|------|------------|
+| `backend-session-service` | [services/session-service.md](services/session-service.md) |
+| `backend-policy-service` | [services/policy-service.md](services/policy-service.md) |
+| `backend-workspace-service` | [services/workspace-service.md](services/workspace-service.md) |
+| `backend-approval-service` | [services/approval-service.md](services/approval-service.md) |
+| `backend-audit-service` | [services/audit-service.md](services/audit-service.md) |
+| `backend-telemetry-service` | [services/telemetry-service.md](services/telemetry-service.md) |
+| `backend-tool-service` | [services/backend-tool-service.md](services/backend-tool-service.md) |
+
+### 23.5 Dependency Rules Between Repos
 
 #### Allowed dependencies
 
-- `desktop-app` -> `protocol-contracts`, `shared-sdk`
-- `local-agent-host`
+- `desktop-app` → `protocol-contracts`, `shared-sdk`
+- `local-agent-host` → `protocol-contracts`, `shared-sdk`
+- `local-tool-runtime` → `protocol-contracts`
+- `backend-*` services → `protocol-contracts`, `shared-sdk`
+- `shared-sdk` → `protocol-contracts`
+- `infra-platform` → all repos (for deployment only)
+- `docs-architecture` → all repos (for documentation only)
+
+#### Prohibited dependencies
+
+- `desktop-app` must not import from `local-agent-host` or `local-tool-runtime` directly — communication is via JSON-RPC only
+- `local-agent-host` must not import from `local-tool-runtime` directly — communication is via the tool routing interface
+- backend services must not import from each other directly — communication is via HTTP APIs only
+- `protocol-contracts` must not import from any service repo
