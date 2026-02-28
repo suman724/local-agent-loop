@@ -1,1 +1,1 @@
-Refer to architecture.md(architecture.md)
+Refer to [architecture.md](architecture.md)
