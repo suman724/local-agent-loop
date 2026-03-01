@@ -166,7 +166,14 @@ Called by the Desktop App to fetch session history or tool output for display.
 
 ### GET /workspaces/{workspaceId}/sessions — List Sessions in Workspace
 
-Called by the Desktop App to show the conversation history list for a project.
+Called by the Desktop App to show the conversation history list for a project. Sessions are aggregated from artifact metadata (grouped by `sessionId`), sorted by most recent activity first.
+
+**Query Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `limit` | int (1–100) | 20 | Page size |
+| `nextToken` | string | — | Opaque cursor for next page |
 
 **Response:**
 ```json
@@ -178,9 +185,12 @@ Called by the Desktop App to show the conversation history list for a project.
       "lastTaskAt": "2026-02-21T16:00:00Z",
       "taskCount": 4
     }
-  ]
+  ],
+  "nextToken": "eyJvZmZzZXQiOiAyMH0="
 }
 ```
+
+`nextToken` is only present when more pages exist. Pass it as a query parameter to fetch the next page.
 
 ---
 
